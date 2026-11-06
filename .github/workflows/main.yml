@@ -16,7 +16,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Optional: 8G swap to handle 7B Q4 models on the 16GB runner
       - name: Add Swap Space (8G)
         run: |
           sudo fallocate -l 8G /mnt/large-swapfile
@@ -25,12 +24,17 @@ jobs:
           sudo swapon /mnt/large-swapfile
           free -h
 
+      - name: Install OpenBLAS (needed by llama-cpp)
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
       - name: Install llama-cpp-python (CPU only) and dependencies
         run: |
           CMAKE_ARGS="-DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS -DGGML_CUDA=OFF"
           pip install llama-cpp-python[server] huggingface-hub fastapi uvicorn jinja2 python-multipart itsdangerous passlib[bcrypt]
-          # Verify no PyTorch was installed
           pip list | grep -i torch || echo "PyTorch is NOT installed (good)"
+
+      - name: Verify llama_cpp imports correctly
+        run: python -c "from llama_cpp import Llama; print('llama_cpp import OK')"
 
       - name: Install cloudflared
         run: |
@@ -57,15 +61,18 @@ jobs:
 
           from llama_cpp import Llama
 
-          # ---------- Configuration ----------
+          # ---------- Configuration (absolute paths!) ----------
+          BASE_DIR = Path(__file__).parent.resolve()
           SECRET_KEY = "change-this-session-secret"
-          CONFIG_FILE = Path("proxy/data/config.json")
-          MODELS_DIR = Path("proxy/models")
+          CONFIG_FILE = BASE_DIR / "data" / "config.json"
+          MODELS_DIR = BASE_DIR / "models"
+          TEMPLATES_DIR = BASE_DIR / "templates"
           MODELS_DIR.mkdir(exist_ok=True)
+          CONFIG_FILE.parent.mkdir(exist_ok=True)
 
           app = FastAPI()
           app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
-          templates = Jinja2Templates(directory="proxy/templates")
+          templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
           pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
           # ---------- Model Manager ----------
@@ -75,16 +82,18 @@ jobs:
                   self.current_model_name: Optional[str] = None
 
               def load_model(self, model_path: str, model_name: str):
-                  # Unload previous model first
                   if self.current_llm is not None:
-                      self.current_llm.close()
+                      try:
+                          self.current_llm.close()
+                      except Exception:
+                          pass
                       self.current_llm = None
                   self.current_llm = Llama(
                       model_path=model_path,
                       n_ctx=4096,
-                      n_threads=os.cpu_count(),
-                      n_gpu_layers=0,          # CPU only
-                      use_mlock=True,          # Lock in RAM
+                      n_threads=os.cpu_count() or 4,
+                      n_gpu_layers=0,
+                      use_mlock=True,
                       verbose=False
                   )
                   self.current_model_name = model_name
@@ -123,7 +132,7 @@ jobs:
                   raise HTTPException(status_code=303, headers={"Location": "/login"})
               return user
 
-          # ---------- First‑time Setup (Router‑style) ----------
+          # ---------- Setup ----------
           @app.get("/setup", response_class=HTMLResponse)
           async def setup_page(request: Request):
               if is_password_set():
@@ -162,10 +171,9 @@ jobs:
               request.session.clear()
               return RedirectResponse(url="/login")
 
-          # ---------- Dashboard: Model Selection & Download ----------
+          # ---------- Dashboard ----------
           @app.get("/", response_class=HTMLResponse)
           async def dashboard(request: Request, user: str = Depends(get_user)):
-              # List local GGUF files
               local_models = [f.name for f in MODELS_DIR.glob("*.gguf")]
               current = manager.current_model_name or "None"
               return templates.TemplateResponse(
@@ -182,7 +190,7 @@ jobs:
                       {"request": request, "user": user,
                        "models": [f.name for f in MODELS_DIR.glob("*.gguf")],
                        "current": manager.current_model_name or "None",
-                       "error": f"Model file '{model_name}' not found locally. Download it first."}
+                       "error": f"Model file '{model_name}' not found locally."}
                   )
               try:
                   manager.load_model(str(model_path), model_name)
@@ -199,15 +207,11 @@ jobs:
           @app.post("/download-model")
           async def download_model(request: Request, repo_id: str = Form(...), filename: str = Form(...), user: str = Depends(get_user)):
               try:
-                  # Download directly into the models directory
-                  path = hf_hub_download(
+                  hf_hub_download(
                       repo_id=repo_id,
                       filename=filename,
-                      local_dir=str(MODELS_DIR),
-                      local_dir_use_symlinks=False
+                      local_dir=str(MODELS_DIR)
                   )
-                  # Rename to a clean name if needed (optional)
-                  # The file will already be in MODELS_DIR
               except Exception as e:
                   return templates.TemplateResponse(
                       "dashboard.html",
@@ -218,144 +222,118 @@ jobs:
                   )
               return RedirectResponse(url="/", status_code=HTTP_303_SEE_OTHER)
 
-          # ---------- OpenAI‑Compatible Endpoints ----------
+          # ---------- OpenAI-compatible ----------
           @app.get("/v1/models")
           async def list_models(user: str = Depends(get_user)):
-              # Return a single model entry representing the currently loaded model
               model_id = manager.current_model_name or "none"
-              return {
-                  "object": "list",
-                  "data": [
-                      {
-                          "id": model_id,
-                          "object": "model",
-                          "created": 0,
-                          "owned_by": "local"
-                      }
-                  ]
-              }
+              return {"object": "list", "data": [{"id": model_id, "object": "model", "created": 0, "owned_by": "local"}]}
 
           @app.post("/v1/chat/completions")
           async def chat_completions(request: Request, user: str = Depends(get_user)):
               body = await request.json()
-              messages = body.get("messages", [])
-              max_tokens = body.get("max_tokens", 512)
-              temperature = body.get("temperature", 0.7)
               try:
-                  response = manager.generate(messages, max_tokens, temperature)
-                  return JSONResponse(content=response)
+                  return JSONResponse(content=manager.generate(
+                      body.get("messages", []),
+                      body.get("max_tokens", 512),
+                      body.get("temperature", 0.7)
+                  ))
               except Exception as e:
                   raise HTTPException(status_code=500, detail=str(e))
 
           @app.post("/v1/completions")
           async def completions(request: Request, user: str = Depends(get_user)):
               body = await request.json()
-              prompt = body.get("prompt", "")
-              max_tokens = body.get("max_tokens", 512)
-              temperature = body.get("temperature", 0.7)
-              # Convert prompt to chat format for simplicity
-              messages = [{"role": "user", "content": prompt}]
+              messages = [{"role": "user", "content": body.get("prompt", "")}]
               try:
-                  response = manager.generate(messages, max_tokens, temperature)
-                  # Adapt to completion format
-                  completion_response = {
+                  response = manager.generate(messages, body.get("max_tokens", 512), body.get("temperature", 0.7))
+                  return JSONResponse(content={
                       "id": f"cmpl-{uuid.uuid4()}",
                       "object": "text_completion",
                       "created": 0,
                       "model": manager.current_model_name or "none",
-                      "choices": [{
-                          "text": response["choices"][0]["message"]["content"],
-                          "index": 0,
-                          "logprobs": None,
-                          "finish_reason": "stop"
-                      }],
+                      "choices": [{"text": response["choices"][0]["message"]["content"], "index": 0, "logprobs": None, "finish_reason": "stop"}],
                       "usage": response.get("usage", {})
-                  }
-                  return JSONResponse(content=completion_response)
+                  })
               except Exception as e:
                   raise HTTPException(status_code=500, detail=str(e))
 
-          # ---------- Health ----------
+          # ---------- Health (unauthenticated, for checks) ----------
           @app.get("/health")
           async def health():
               return {"status": "ok", "model": manager.current_model_name or "none"}
           PYEOF
 
-          # ---------- Templates ----------
           cat > proxy/templates/setup.html << 'HTMLEOF'
-          <!DOCTYPE html>
-          <html>
-          <head><title>First‑time Setup</title></head>
-          <body>
-            <h2>Welcome! Set up your admin password</h2>
-            {% if error %}<p style="color:red">{{ error }}</p>{% endif %}
-            <form method="post" action="/setup">
-              <label>Password: <input name="password" type="password" required></label><br>
-              <label>Confirm: <input name="confirm" type="password" required></label><br>
-              <button type="submit">Save password</button>
-            </form>
-          </body>
-          </html>
+          <!DOCTYPE html><html><head><title>Setup</title></head><body>
+          <h2>Welcome! Set up your admin password</h2>
+          {% if error %}<p style="color:red">{{ error }}</p>{% endif %}
+          <form method="post" action="/setup">
+            <label>Password: <input name="password" type="password" required></label><br>
+            <label>Confirm: <input name="confirm" type="password" required></label><br>
+            <button type="submit">Save password</button>
+          </form></body></html>
           HTMLEOF
 
           cat > proxy/templates/login.html << 'HTMLEOF'
-          <!DOCTYPE html>
-          <html>
-          <head><title>Login</title></head>
-          <body>
-            <h2>Sign in</h2>
-            {% if error %}<p style="color:red">{{ error }}</p>{% endif %}
-            <form method="post" action="/login">
-              <label>Password: <input name="password" type="password" required></label><br>
-              <button type="submit">Login</button>
-            </form>
-          </body>
-          </html>
+          <!DOCTYPE html><html><head><title>Login</title></head><body>
+          <h2>Sign in</h2>
+          {% if error %}<p style="color:red">{{ error }}</p>{% endif %}
+          <form method="post" action="/login">
+            <label>Password: <input name="password" type="password" required></label><br>
+            <button type="submit">Login</button>
+          </form></body></html>
           HTMLEOF
 
           cat > proxy/templates/dashboard.html << 'HTMLEOF'
-          <!DOCTYPE html>
-          <html>
-          <head><title>LLM Dashboard</title></head>
-          <body>
-            <h2>Welcome, {{ user }}! <a href="/logout">Logout</a></h2>
-            <p><strong>Current model:</strong> {{ current }}</p>
-            {% if error %}<p style="color:red">{{ error }}</p>{% endif %}
-
-            <h3>Load an existing model</h3>
-            <form method="post" action="/load-model">
-              <select name="model_name">
-                {% for m in models %}
-                <option value="{{ m }}" {% if m == current %}selected{% endif %}>{{ m }}</option>
-                {% endfor %}
-              </select>
-              <button type="submit">Load</button>
-            </form>
-
-            <hr>
-
-            <h3>Download a new model from Hugging Face</h3>
-            <form method="post" action="/download-model">
-              <input name="repo_id" placeholder="e.g. TheBloke/Llama-2-7B-GGUF" size="50" required><br>
-              <input name="filename" placeholder="e.g. llama-2-7b.Q4_K_M.gguf" size="50" required><br>
-              <button type="submit">Download</button>
-            </form>
-            <p><small>After downloading, the file will appear in the list above. Then select it and click "Load".</small></p>
-
-            <hr>
-            <p>OpenAI‑SDK endpoint: <code>https://&lt;your‑tunnel&gt;/v1</code></p>
-            <p>API key: <code>any‑string</code> (session auth is used)</p>
-          </body>
-          </html>
+          <!DOCTYPE html><html><head><title>LLM Dashboard</title></head><body>
+          <h2>Welcome, {{ user }}! <a href="/logout">Logout</a></h2>
+          <p><strong>Current model:</strong> {{ current }}</p>
+          {% if error %}<p style="color:red">{{ error }}</p>{% endif %}
+          <h3>Load an existing model</h3>
+          <form method="post" action="/load-model">
+            <select name="model_name">
+              {% for m in models %}<option value="{{ m }}" {% if m == current %}selected{% endif %}>{{ m }}</option>{% endfor %}
+            </select>
+            <button type="submit">Load</button>
+          </form>
+          <hr>
+          <h3>Download a new model from Hugging Face</h3>
+          <form method="post" action="/download-model">
+            <input name="repo_id" placeholder="e.g. TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF" size="60" required><br>
+            <input name="filename" placeholder="e.g. tinyllama-1.1b-chat-v1.0.Q8_0.gguf" size="60" required><br>
+            <button type="submit">Download</button>
+          </form>
+          <hr>
+          <p>OpenAI-SDK endpoint: <code>https://&lt;your-tunnel&gt;/v1</code></p>
+          </body></html>
           HTMLEOF
 
-      - name: Start Custom Proxy
+      - name: Start Custom Proxy (with health check)
         run: |
           cd proxy
-          nohup uvicorn main:app --host 0.0.0.0 --port 8000 > proxy.log 2>&1 &
+          nohup uvicorn main:app --host 127.0.0.1 --port 8000 > proxy.log 2>&1 &
           echo $! > proxy.pid
-          sleep 5
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then
+              echo "✅ Proxy is up after ${i}s"
+              curl -s http://127.0.0.1:8000/health
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "❌ Proxy failed to start. Log:"
+          cat proxy.log
+          exit 1
+
+      - name: Dump proxy log on failure
+        if: failure()
+        run: |
+          echo "=== proxy.log ==="
+          cat proxy/proxy.log 2>/dev/null || echo "(no log)"
+          echo "=== ps ==="
+          ps aux | grep -E "uvicorn|python" | grep -v grep || true
 
       - name: Expose via Cloudflare Tunnel
         run: |
-          cloudflared tunnel --url http://localhost:8000 --no-autoupdate
+          # Force IPv4 to avoid the [::1] connection-refused issue
+          cloudflared tunnel --url http://127.0.0.1:8000 --no-autoupdate
