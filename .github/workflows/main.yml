@@ -1,4 +1,4 @@
-name: Custom‑Auth LLM Proxy (No PyTorch, No oobabooga)
+name: Custom‑Auth LLM Proxy (Prebuilt Wheels, No PyTorch)
 
 on:
   workflow_dispatch:
@@ -24,14 +24,15 @@ jobs:
           sudo swapon /mnt/large-swapfile
           free -h
 
-      - name: Install OpenBLAS (needed by llama-cpp)
-        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
-
-      - name: Install llama-cpp-python (CPU only) and dependencies
+      - name: Install llama-cpp-python (prebuilt CPU wheel) and dependencies
         run: |
-          CMAKE_ARGS="-DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS -DGGML_CUDA=OFF"
-          pip install llama-cpp-python[server] huggingface-hub fastapi uvicorn jinja2 python-multipart itsdangerous passlib[bcrypt]
+          pip install llama-cpp-python[server] \
+            --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu \
+            --prefer-binary
+          # NOTE: passlib/bcrypt removed — using stdlib hashlib instead
+          pip install huggingface-hub fastapi uvicorn jinja2 python-multipart itsdangerous
           pip list | grep -i torch || echo "PyTorch is NOT installed (good)"
+          pip list | grep -iE "passlib|bcrypt" || echo "passlib/bcrypt NOT installed (good)"
 
       - name: Verify llama_cpp imports correctly
         run: python -c "from llama_cpp import Llama; print('llama_cpp import OK')"
@@ -48,6 +49,9 @@ jobs:
           import os
           import json
           import uuid
+          import hashlib
+          import secrets
+          import traceback
           from pathlib import Path
           from typing import Optional
 
@@ -56,12 +60,11 @@ jobs:
           from fastapi.templating import Jinja2Templates
           from starlette.middleware.sessions import SessionMiddleware
           from starlette.status import HTTP_303_SEE_OTHER
-          from passlib.context import CryptContext
           from huggingface_hub import hf_hub_download
 
           from llama_cpp import Llama
 
-          # ---------- Configuration (absolute paths!) ----------
+          # ---------- Configuration ----------
           BASE_DIR = Path(__file__).parent.resolve()
           SECRET_KEY = "change-this-session-secret"
           CONFIG_FILE = BASE_DIR / "data" / "config.json"
@@ -70,10 +73,37 @@ jobs:
           MODELS_DIR.mkdir(exist_ok=True)
           CONFIG_FILE.parent.mkdir(exist_ok=True)
 
+          print(f"[startup] BASE_DIR = {BASE_DIR}", flush=True)
+          print(f"[startup] TEMPLATES_DIR exists: {TEMPLATES_DIR.exists()}", flush=True)
+          print(f"[startup] setup.html exists: {(TEMPLATES_DIR / 'setup.html').exists()}", flush=True)
+
           app = FastAPI()
           app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
           templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
-          pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+          # ---------- Log all exceptions to proxy.log ----------
+          @app.middleware("http")
+          async def log_exceptions(request: Request, call_next):
+              try:
+                  return await call_next(request)
+              except Exception as e:
+                  print(f"[ERROR] {request.method} {request.url.path}: {e}", flush=True)
+                  traceback.print_exc()
+                  raise
+
+          # ---------- Password hashing (stdlib only, no passlib) ----------
+          def hash_password(password: str) -> str:
+              salt = secrets.token_hex(16)
+              h = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100_000)
+              return f"{salt}${h.hex()}"
+
+          def check_password(password: str, stored: str) -> bool:
+              try:
+                  salt, expected = stored.split('$', 1)
+                  h = hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100_000)
+                  return secrets.compare_digest(h.hex(), expected)
+              except (ValueError, AttributeError):
+                  return False
 
           # ---------- Model Manager ----------
           class ModelManager:
@@ -109,7 +139,7 @@ jobs:
 
           manager = ModelManager()
 
-          # ---------- Auth Helpers ----------
+          # ---------- Config helpers ----------
           def load_config():
               if CONFIG_FILE.exists():
                   return json.loads(CONFIG_FILE.read_text())
@@ -122,32 +152,29 @@ jobs:
           def is_password_set():
               return "password_hash" in load_config()
 
-          def verify_password(password: str) -> bool:
-              cfg = load_config()
-              return pwd_context.verify(password, cfg.get("password_hash", ""))
-
           def get_user(request: Request):
               user = request.session.get("user")
               if not user:
                   raise HTTPException(status_code=303, headers={"Location": "/login"})
               return user
 
-          # ---------- Setup ----------
+          # ---------- Setup (new Starlette signature!) ----------
           @app.get("/setup", response_class=HTMLResponse)
           async def setup_page(request: Request):
+              print(f"[setup] GET received, is_password_set={is_password_set()}", flush=True)
               if is_password_set():
                   return RedirectResponse(url="/login")
-              return templates.TemplateResponse("setup.html", {"request": request})
+              return templates.TemplateResponse(request, "setup.html", {})
 
           @app.post("/setup")
           async def setup(request: Request, password: str = Form(...), confirm: str = Form(...)):
               if is_password_set():
                   return RedirectResponse(url="/login")
               if password != confirm:
-                  return templates.TemplateResponse("setup.html", {"request": request, "error": "Passwords do not match"})
+                  return templates.TemplateResponse(request, "setup.html", {"error": "Passwords do not match"})
               if len(password) < 4:
-                  return templates.TemplateResponse("setup.html", {"request": request, "error": "Password too short (min 4 chars)"})
-              save_config({"password_hash": pwd_context.hash(password)})
+                  return templates.TemplateResponse(request, "setup.html", {"error": "Password too short (min 4 chars)"})
+              save_config({"password_hash": hash_password(password)})
               return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
 
           # ---------- Login / Logout ----------
@@ -155,16 +182,17 @@ jobs:
           async def login_page(request: Request):
               if not is_password_set():
                   return RedirectResponse(url="/setup")
-              return templates.TemplateResponse("login.html", {"request": request})
+              return templates.TemplateResponse(request, "login.html", {})
 
           @app.post("/login")
           async def login(request: Request, password: str = Form(...)):
               if not is_password_set():
                   return RedirectResponse(url="/setup")
-              if verify_password(password):
+              cfg = load_config()
+              if check_password(password, cfg.get("password_hash", "")):
                   request.session["user"] = "admin"
                   return RedirectResponse(url="/", status_code=HTTP_303_SEE_OTHER)
-              return templates.TemplateResponse("login.html", {"request": request, "error": "Wrong password"})
+              return templates.TemplateResponse(request, "login.html", {"error": "Wrong password"})
 
           @app.get("/logout")
           async def logout(request: Request):
@@ -176,50 +204,42 @@ jobs:
           async def dashboard(request: Request, user: str = Depends(get_user)):
               local_models = [f.name for f in MODELS_DIR.glob("*.gguf")]
               current = manager.current_model_name or "None"
-              return templates.TemplateResponse(
-                  "dashboard.html",
-                  {"request": request, "user": user, "models": local_models, "current": current}
-              )
+              return templates.TemplateResponse(request, "dashboard.html", {
+                  "user": user, "models": local_models, "current": current
+              })
 
           @app.post("/load-model")
           async def load_model(request: Request, model_name: str = Form(...), user: str = Depends(get_user)):
               model_path = MODELS_DIR / model_name
               if not model_path.exists():
-                  return templates.TemplateResponse(
-                      "dashboard.html",
-                      {"request": request, "user": user,
-                       "models": [f.name for f in MODELS_DIR.glob("*.gguf")],
-                       "current": manager.current_model_name or "None",
-                       "error": f"Model file '{model_name}' not found locally."}
-                  )
+                  return templates.TemplateResponse(request, "dashboard.html", {
+                      "user": user,
+                      "models": [f.name for f in MODELS_DIR.glob("*.gguf")],
+                      "current": manager.current_model_name or "None",
+                      "error": f"Model file '{model_name}' not found locally."
+                  })
               try:
                   manager.load_model(str(model_path), model_name)
               except Exception as e:
-                  return templates.TemplateResponse(
-                      "dashboard.html",
-                      {"request": request, "user": user,
-                       "models": [f.name for f in MODELS_DIR.glob("*.gguf")],
-                       "current": manager.current_model_name or "None",
-                       "error": f"Load failed: {e}"}
-                  )
+                  return templates.TemplateResponse(request, "dashboard.html", {
+                      "user": user,
+                      "models": [f.name for f in MODELS_DIR.glob("*.gguf")],
+                      "current": manager.current_model_name or "None",
+                      "error": f"Load failed: {e}"
+                  })
               return RedirectResponse(url="/", status_code=HTTP_303_SEE_OTHER)
 
           @app.post("/download-model")
           async def download_model(request: Request, repo_id: str = Form(...), filename: str = Form(...), user: str = Depends(get_user)):
               try:
-                  hf_hub_download(
-                      repo_id=repo_id,
-                      filename=filename,
-                      local_dir=str(MODELS_DIR)
-                  )
+                  hf_hub_download(repo_id=repo_id, filename=filename, local_dir=str(MODELS_DIR))
               except Exception as e:
-                  return templates.TemplateResponse(
-                      "dashboard.html",
-                      {"request": request, "user": user,
-                       "models": [f.name for f in MODELS_DIR.glob("*.gguf")],
-                       "current": manager.current_model_name or "None",
-                       "error": f"Download failed: {e}"}
-                  )
+                  return templates.TemplateResponse(request, "dashboard.html", {
+                      "user": user,
+                      "models": [f.name for f in MODELS_DIR.glob("*.gguf")],
+                      "current": manager.current_model_name or "None",
+                      "error": f"Download failed: {e}"
+                  })
               return RedirectResponse(url="/", status_code=HTTP_303_SEE_OTHER)
 
           # ---------- OpenAI-compatible ----------
@@ -257,7 +277,7 @@ jobs:
               except Exception as e:
                   raise HTTPException(status_code=500, detail=str(e))
 
-          # ---------- Health (unauthenticated, for checks) ----------
+          # ---------- Health ----------
           @app.get("/health")
           async def health():
               return {"status": "ok", "model": manager.current_model_name or "none"}
@@ -308,32 +328,43 @@ jobs:
           </body></html>
           HTMLEOF
 
-      - name: Start Custom Proxy (with health check)
+      - name: Start Custom Proxy (with extended health check)
         run: |
           cd proxy
-          nohup uvicorn main:app --host 127.0.0.1 --port 8000 > proxy.log 2>&1 &
+          nohup python -u -m uvicorn main:app --host 127.0.0.1 --port 8000 > proxy.log 2>&1 &
           echo $! > proxy.pid
           for i in $(seq 1 30); do
             if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then
               echo "✅ Proxy is up after ${i}s"
-              curl -s http://127.0.0.1:8000/health
-              exit 0
+              break
             fi
             sleep 1
           done
-          echo "❌ Proxy failed to start. Log:"
-          cat proxy.log
-          exit 1
+          echo "=== /health ==="
+          curl -s http://127.0.0.1:8000/health || echo "(failed)"
+          echo ""
+          echo "=== /setup ==="
+          curl -s -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1:8000/setup || echo "(failed)"
+          echo ""
+          echo "=== proxy.log (tail) ==="
+          tail -40 proxy/proxy.log || true
+
+      - name: Fail job if /setup not 200
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8000/setup || echo "000")
+          echo "GET /setup → HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "❌ /setup is not returning 200. Full proxy.log:"
+            cat proxy/proxy.log
+            exit 1
+          fi
 
       - name: Dump proxy log on failure
         if: failure()
         run: |
-          echo "=== proxy.log ==="
-          cat proxy/proxy.log 2>/dev/null || echo "(no log)"
-          echo "=== ps ==="
-          ps aux | grep -E "uvicorn|python" | grep -v grep || true
+          echo "=== proxy.log ===" && cat proxy/proxy.log 2>/dev/null || true
+          echo "=== ps ===" && ps aux | grep -E "uvicorn|python" | grep -v grep || true
 
       - name: Expose via Cloudflare Tunnel
         run: |
-          # Force IPv4 to avoid the [::1] connection-refused issue
           cloudflared tunnel --url http://127.0.0.1:8000 --no-autoupdate
