@@ -1,4 +1,4 @@
-name: Custom‑Auth LLM Proxy (Model Store Selection)
+name: Custom‑Auth LLM Proxy (CPU Throttling & 4096 Context)
 
 on:
   workflow_dispatch:
@@ -52,6 +52,8 @@ jobs:
           import secrets
           import time
           import traceback
+          import threading
+          import asyncio
           from pathlib import Path
           from typing import Optional, AsyncGenerator, List, Dict, Any
 
@@ -82,10 +84,13 @@ jobs:
           templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
           hf_api = HfApi()
 
-          # ---------- Security Tracking ----------
+          # ---------- Safety & Concurrency Tracking ----------
           failed_logins: Dict[str, int] = {}
           banned_ips: set = set()
           MAX_ATTEMPTS = 10
+          MAX_NEW_TOKENS = 4096
+          
+          inference_lock = threading.Lock()
 
           def get_client_ip(request: Request) -> str:
               cf_ip = request.headers.get("CF-Connecting-IP")
@@ -128,88 +133,114 @@ jobs:
                   self.current_chat_handler: Optional[Any] = None
 
               def load_model(self, model_path: str, model_name: str):
-                  if self.current_llm is not None:
-                      try:
-                          self.current_llm.close()
-                      except Exception:
-                          pass
-                      self.current_llm = None
-                      self.current_chat_handler = None
+                  with inference_lock:
+                      if self.current_llm is not None:
+                          try:
+                              self.current_llm.close()
+                          except Exception:
+                              pass
+                          self.current_llm = None
+                          self.current_chat_handler = None
 
-                  is_vision = any(tag in model_name.lower() for tag in ["vision", "vl", "llava", "qwen2.5-vl", "gemma-4"])
-                  chat_handler = None
-                  
-                  if is_vision and MTMDChatHandler is not None:
-                      try:
-                          chat_handler = MTMDChatHandler()
-                          print(f"[vision] Using MTMDChatHandler for {model_name}", flush=True)
-                      except Exception as e:
-                          print(f"[vision] MTMD handler init failed: {e}. Will fallback.", flush=True)
+                      is_vision = any(tag in model_name.lower() for tag in ["vision", "vl", "llava", "qwen2.5-vl", "gemma-4"])
+                      chat_handler = None
+                      
+                      if is_vision and MTMDChatHandler is not None:
+                          try:
+                              chat_handler = MTMDChatHandler()
+                              print(f"[vision] Using MTMDChatHandler for {model_name}", flush=True)
+                          except Exception as e:
+                              print(f"[vision] MTMD handler init failed: {e}. Will fallback.", flush=True)
 
-                  try:
-                      self.current_llm = Llama(
-                          model_path=model_path,
-                          n_ctx=4096,
-                          n_threads=os.cpu_count() or 4,
-                          n_gpu_layers=0,
-                          use_mlock=True,
-                          verbose=False,
-                          chat_handler=chat_handler,
-                      )
-                  except Exception as e:
-                      if chat_handler is not None:
-                          print(f"[vision] Load with MTMD failed: {e}. Retrying as text-only.", flush=True)
+                      try:
+                          # THROTTLING: Leaving 1 CPU core free for the web server
+                          safe_threads = max(1, (os.cpu_count() or 4) - 1)
+                          print(f"[load] Loading {model_name} with {safe_threads} threads.", flush=True)
+                          
                           self.current_llm = Llama(
                               model_path=model_path,
-                              n_ctx=4096,
-                              n_threads=os.cpu_count() or 4,
+                              n_ctx=4096, # Restored to 4096
+                              n_threads=safe_threads, 
                               n_gpu_layers=0,
                               use_mlock=True,
                               verbose=False,
+                              chat_handler=chat_handler,
                           )
-                          chat_handler = None
-                      else:
-                          raise e
+                      except Exception as e:
+                          if chat_handler is not None:
+                              print(f"[vision] Load with MTMD failed: {e}. Retrying as text-only.", flush=True)
+                              self.current_llm = Llama(
+                                  model_path=model_path,
+                                  n_ctx=4096,
+                                  n_threads=safe_threads,
+                                  n_gpu_layers=0,
+                                  use_mlock=True,
+                                  verbose=False,
+                              )
+                              chat_handler = None
+                          else:
+                              raise e
 
-                  self.current_model_name = model_name
-                  self.current_chat_handler = chat_handler
-                  self.last_stats = {}
+                      self.current_model_name = model_name
+                      self.current_chat_handler = chat_handler
+                      self.last_stats = {}
 
-              def generate(self, messages, **kwargs):
-                  if self.current_llm is None:
-                      raise RuntimeError("No model loaded")
-                  t0 = time.time()
-                  result = self.current_llm.create_chat_completion(messages=messages, **kwargs)
-                  elapsed = time.time() - t0
-                  if isinstance(result, dict):
-                      result["model"] = self.current_model_name
-                      usage = result.get("usage", {})
-                      timings = result.get("timings", {})
-                      completion_tokens = usage.get("completion_tokens", 0)
-                      eval_time = timings.get("eval_time", 0) or elapsed
-                      tps = completion_tokens / eval_time if eval_time > 0 else 0
-                      result["timings"] = {
-                          "total_time": round(elapsed, 3),
-                          "eval_time": round(eval_time, 3),
-                          "completion_tokens": completion_tokens,
-                          "tokens_per_second": round(tps, 2),
-                      }
-                      self.last_stats = result["timings"]
-                  return result
+              def generate_sync(self, messages, **kwargs):
+                  """Synchronous generation to be run in a thread."""
+                  with inference_lock:
+                      t0 = time.time()
+                      try:
+                          result = self.current_llm.create_chat_completion(
+                              messages=messages, 
+                              max_tokens=kwargs.get("max_tokens", MAX_NEW_TOKENS), 
+                              **{k: v for k, v in kwargs.items() if k != "max_tokens"}
+                          )
+                      except Exception as e:
+                          print(f"[ERROR] Inference failed: {e}", flush=True)
+                          raise RuntimeError(f"Model crashed or context limit exceeded: {str(e)}")
+                          
+                      elapsed = time.time() - t0
+                      if isinstance(result, dict):
+                          result["model"] = self.current_model_name
+                          usage = result.get("usage", {})
+                          timings = result.get("timings", {})
+                          completion_tokens = usage.get("completion_tokens", 0)
+                          eval_time = timings.get("eval_time", 0) or elapsed
+                          tps = completion_tokens / eval_time if eval_time > 0 else 0
+                          result["timings"] = {
+                              "total_time": round(elapsed, 3),
+                              "eval_time": round(eval_time, 3),
+                              "completion_tokens": completion_tokens,
+                              "tokens_per_second": round(tps, 2),
+                          }
+                          self.last_stats = result["timings"]
+                      return result
 
-              def stream(self, messages, **kwargs) -> AsyncGenerator[str, None]:
-                  if self.current_llm is None:
-                      raise RuntimeError("No model loaded")
+              def stream_sync(self, messages, **kwargs) -> AsyncGenerator[str, None]:
+                  """Synchronous streaming generator. Will be yielded asynchronously."""
                   t0 = time.time()
                   completion_tokens = 0
-                  for chunk in self.current_llm.create_chat_completion(messages=messages, stream=True, **kwargs):
-                      if isinstance(chunk, dict):
-                          chunk["model"] = self.current_model_name
-                          if chunk.get("choices"):
-                              delta = chunk["choices"][0].get("delta", {})
-                              if delta.get("content") or delta.get("tool_calls"):
-                                  completion_tokens += 1
-                      yield f"data: {json.dumps(chunk)}\n\n"
+                  
+                  with inference_lock:
+                      try:
+                          for chunk in self.current_llm.create_chat_completion(
+                              messages=messages, 
+                              max_tokens=kwargs.get("max_tokens", MAX_NEW_TOKENS), 
+                              stream=True, 
+                              **{k: v for k, v in kwargs.items() if k != "max_tokens"}
+                          ):
+                              if isinstance(chunk, dict):
+                                  chunk["model"] = self.current_model_name
+                                  if chunk.get("choices"):
+                                      delta = chunk["choices"][0].get("delta", {})
+                                      if delta.get("content") or delta.get("tool_calls"):
+                                          completion_tokens += 1
+                              yield chunk
+                      except Exception as e:
+                          print(f"[ERROR] Streaming failed: {e}", flush=True)
+                          yield {"error": str(e)}
+                          return
+                  
                   elapsed = time.time() - t0
                   tps = completion_tokens / elapsed if elapsed > 0 else 0
                   self.last_stats = {
@@ -231,7 +262,28 @@ jobs:
                       },
                       "timings": self.last_stats,
                   }
-                  yield f"data: {json.dumps(final)}\n\n"
+                  yield final
+
+              async def generate_async(self, messages, **kwargs):
+                  """Run synchronous generation in a background thread."""
+                  if self.current_llm is None:
+                      raise RuntimeError("No model loaded")
+                  return await asyncio.to_thread(self.generate_sync, messages, **kwargs)
+
+              async def stream_async(self, messages, **kwargs) -> AsyncGenerator[str, None]:
+                  """Async wrapper around the synchronous stream, adding a slow-down delay."""
+                  if self.current_llm is None:
+                      raise RuntimeError("No model loaded")
+                  
+                  # THROTTLING: Yield to event loop, allowing web server to breathe
+                  for chunk in self.stream_sync(messages, **kwargs):
+                      if "error" in chunk:
+                          yield f"data: {json.dumps(chunk)}\n\n"
+                          return
+                      yield f"data: {json.dumps(chunk)}\n\n"
+                      # THE SAFETY SLOW-DOWN LAYER:
+                      await asyncio.sleep(0.01) 
+                  
                   yield "data: [DONE]\n\n"
 
           manager = ModelManager()
@@ -357,7 +409,7 @@ jobs:
                   model_path = MODELS_DIR / model_name
                   if not model_path.exists():
                       return JSONResponse(status_code=404, content={"error": f"Model '{model_name}' not found."})
-                  manager.load_model(str(model_path), model_name)
+                  await asyncio.to_thread(manager.load_model, str(model_path), model_name)
                   return {"status": "ok"}
               except Exception as e:
                   return JSONResponse(status_code=500, content={"error": str(e)})
@@ -368,7 +420,7 @@ jobs:
                   body = await request.json()
                   repo_id = body.get("repo_id")
                   filename = body.get("filename")
-                  hf_hub_download(repo_id=repo_id, filename=filename, local_dir=str(MODELS_DIR))
+                  await asyncio.to_thread(hf_hub_download, repo_id=repo_id, filename=filename, local_dir=str(MODELS_DIR))
                   return {"status": "ok"}
               except Exception as e:
                   return JSONResponse(status_code=500, content={"error": str(e)})
@@ -381,7 +433,8 @@ jobs:
           @app.get("/api/store/search")
           async def api_store_search(q: str = "", vision_only: bool = False):
               try:
-                  models = hf_api.list_models(
+                  models = await asyncio.to_thread(
+                      hf_api.list_models,
                       search=q,
                       filter="gguf",
                       sort="downloads",
@@ -410,19 +463,18 @@ jobs:
           @app.get("/api/store/files")
           async def api_store_files(repo_id: str):
               try:
-                  files = hf_api.list_repo_files(repo_id=repo_id)
+                  files = await asyncio.to_thread(hf_api.list_repo_files, repo_id=repo_id)
                   gguf_files = [f for f in files if f.endswith(".gguf")]
                   
                   if not gguf_files:
                       return {"repo_id": repo_id, "files": [], "error": "No GGUF files found in this repo."}
                   
-                  # Sort files alphabetically so quantizations are grouped nicely
                   gguf_files.sort()
                   return {"repo_id": repo_id, "files": gguf_files}
               except Exception as e:
                   return JSONResponse(status_code=500, content={"error": str(e)})
 
-          # ---------- OpenAI-compatible ----------
+          # ---------- OpenAI-compatible (with Safety Layer) ----------
           @app.get("/v1/models")
           async def list_models(user: str = Depends(get_api_user)):
               model_id = manager.current_model_name or "none"
@@ -436,13 +488,14 @@ jobs:
               try:
                   if stream:
                       return StreamingResponse(
-                          manager.stream(messages, **body),
+                          manager.stream_async(messages, **body),
                           media_type="text/event-stream",
                           headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
                       )
-                  return JSONResponse(content=manager.generate(messages, **body))
+                  result = await manager.generate_async(messages, **body)
+                  return JSONResponse(content=result)
               except Exception as e:
-                  raise HTTPException(status_code=500, detail=str(e))
+                  return JSONResponse(status_code=500, content={"error": str(e)})
 
           @app.get("/health")
           async def health():
@@ -521,6 +574,8 @@ jobs:
                 border: 1px solid rgba(148, 163, 184, 0.2); }
               .badge.vision { background: rgba(139, 92, 246, 0.15); color: #a78bfa;
                 border: 1px solid rgba(139, 92, 246, 0.3); }
+              .badge.warning { background: rgba(245, 158, 11, 0.15); color: var(--warning);
+                border: 1px solid rgba(245, 158, 11, 0.3); }
               .mono-large { font-family: 'SF Mono', monospace; font-size: 0.9rem; color: var(--text);
                 word-break: break-all; padding: 0.75rem; background: rgba(15, 23, 42, 0.8);
                 border-radius: 8px; border: 1px solid var(--border); }
@@ -775,7 +830,6 @@ jobs:
               </div>
               <label>API Key</label>
               <div class="input-group">
-                <!-- API key is masked by default using type="password" -->
                 <input type="password" id="apiKey" value="{{ api_key }}" readonly class="mono">
                 <button type="button" class="btn-secondary" onclick="togglePassword('apiKey', this)">Show</button>
                 <button type="button" class="btn-secondary" onclick="copyText('apiKey', this)">Copy</button>
@@ -858,7 +912,6 @@ jobs:
                 models.forEach(m => {
                   const item = document.createElement('div');
                   item.className = 'model-item';
-                  // Safely format the ID for the DOM
                   const safeId = m.id.replace(/[^a-zA-Z0-9]/g, '_');
                   item.innerHTML = `
                     <div class="model-info">
@@ -889,9 +942,15 @@ jobs:
                 if (!res.ok) throw new Error(data.error || 'Failed to get files');
                 if (data.error) throw new Error(data.error);
                 
-                // Create a dropdown of all files
                 const selectId = 'select_' + repoId.replace(/[^a-zA-Z0-9]/g, '_');
-                let options = data.files.map(f => `<option value="${f}">${f}</option>`).join('');
+                
+                let options = data.files.map(f => {
+                  let warning = "";
+                  if (f.toUpperCase().includes("Q8") || f.toUpperCase().includes("F16") || f.toUpperCase().includes("32B") || f.toUpperCase().includes("70B")) {
+                      warning = " ⚠️ (Large file, likely to crash 16GB RAM runner)";
+                  }
+                  return `<option value="${f}">${f}${warning}</option>`;
+                }).join('');
                 
                 btn.parentElement.innerHTML = `
                   <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; justify-content: flex-end;">
@@ -938,14 +997,23 @@ jobs:
         run: |
           cd proxy
           nohup python -u -m uvicorn main:app --host 127.0.0.1 --port 8000 > proxy.log 2>&1 &
-          echo $! > proxy.pid
+          PID=$!
+          echo "Started Uvicorn with PID $PID"
+          
           for i in $(seq 1 30); do
+            if ! kill -0 $PID 2>/dev/null; then
+              echo "❌ Uvicorn process died immediately!"
+              cat proxy.log
+              exit 1
+            fi
+            
             if curl -sf http://127.0.0.1:8000/health > /dev/null 2>&1; then
               echo "✅ Proxy is up after ${i}s"
               break
             fi
             sleep 1
           done
+          
           echo "=== /health ===" && curl -s http://127.0.0.1:8000/health
           echo ""
           echo "=== /setup ===" && curl -s -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1:8000/setup
