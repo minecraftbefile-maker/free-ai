@@ -388,7 +388,6 @@ jobs:
                       search=q,
                       filter="gguf",
                       sort="downloads",
-                      direction=-1,
                       limit=30,
                       expand=["tags"]
                   )
