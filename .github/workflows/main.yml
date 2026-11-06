@@ -1,4 +1,4 @@
-name: Custom‑Auth LLM Proxy (Security & UI Updates)
+name: Custom‑Auth LLM Proxy (Model Store Selection)
 
 on:
   workflow_dispatch:
@@ -88,7 +88,6 @@ jobs:
           MAX_ATTEMPTS = 10
 
           def get_client_ip(request: Request) -> str:
-              # Get real IP if behind Cloudflare
               cf_ip = request.headers.get("CF-Connecting-IP")
               if cf_ip:
                   return cf_ip
@@ -310,12 +309,10 @@ jobs:
 
               cfg = load_config()
               if check_password(password, cfg.get("password_hash", "")):
-                  # Success: clear failed attempts
                   failed_logins.pop(ip, None)
                   request.session["user"] = "admin"
                   return RedirectResponse(url="/", status_code=HTTP_303_SEE_OTHER)
               
-              # Failure: increment counter
               failed_logins[ip] = failed_logins.get(ip, 0) + 1
               remaining = MAX_ATTEMPTS - failed_logins[ip]
               
@@ -414,14 +411,14 @@ jobs:
           async def api_store_files(repo_id: str):
               try:
                   files = hf_api.list_repo_files(repo_id=repo_id)
-                  gguf_files = [f for f in files if f.endswith(".gguf") and "-of-" not in f]
+                  gguf_files = [f for f in files if f.endswith(".gguf")]
                   
-                  if len(gguf_files) == 1:
-                      return {"repo_id": repo_id, "file": gguf_files[0]}
-                  elif len(gguf_files) > 1:
-                      return {"repo_id": repo_id, "file": None, "error": "Multiple GGUF files found. This store only supports single-file models."}
-                  else:
-                      return {"repo_id": repo_id, "file": None, "error": "No single-file GGUF models found in this repo."}
+                  if not gguf_files:
+                      return {"repo_id": repo_id, "files": [], "error": "No GGUF files found in this repo."}
+                  
+                  # Sort files alphabetically so quantizations are grouped nicely
+                  gguf_files.sort()
+                  return {"repo_id": repo_id, "files": gguf_files}
               except Exception as e:
                   return JSONResponse(status_code=500, content={"error": str(e)})
 
@@ -452,7 +449,7 @@ jobs:
               return {"status": "ok", "model": manager.current_model_name or "none", "last_stats": manager.last_stats}
           PYEOF
 
-          # ---------- base.html (Includes Loading Overlay & JS) ----------
+          # ---------- base.html ----------
           cat > proxy/templates/base.html << 'HTMLEOF'
           <!DOCTYPE html>
           <html lang="en">
@@ -812,7 +809,7 @@ jobs:
 
             <div class="card">
               <h2>Discover Models</h2>
-              <p class="muted">Search Hugging Face for single-file GGUF models.</p>
+              <p class="muted">Search Hugging Face for GGUF models.</p>
               <form id="searchForm" class="row" style="margin-bottom: 1rem;">
                 <input type="text" id="searchInput" placeholder="Search model name (e.g. llama, mistral)..." style="margin-bottom: 0;">
                 <label style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0; text-transform: none; font-size: 0.9rem;">
@@ -861,12 +858,14 @@ jobs:
                 models.forEach(m => {
                   const item = document.createElement('div');
                   item.className = 'model-item';
+                  // Safely format the ID for the DOM
+                  const safeId = m.id.replace(/[^a-zA-Z0-9]/g, '_');
                   item.innerHTML = `
                     <div class="model-info">
                       <div class="model-name">${m.id} ${m.is_vision ? '<span class="badge vision">Vision</span>' : ''}</div>
                       <div class="model-meta">${m.downloads} downloads</div>
                     </div>
-                    <div class="model-actions">
+                    <div class="model-actions" id="actions_${safeId}">
                       <button class="btn-secondary" onclick="fetchFiles('${m.id}', this)">Get Files</button>
                     </div>
                   `;
@@ -890,7 +889,18 @@ jobs:
                 if (!res.ok) throw new Error(data.error || 'Failed to get files');
                 if (data.error) throw new Error(data.error);
                 
-                btn.outerHTML = `<button onclick="downloadFile('${repoId}', '${data.file}', this)">Download</button>`;
+                // Create a dropdown of all files
+                const selectId = 'select_' + repoId.replace(/[^a-zA-Z0-9]/g, '_');
+                let options = data.files.map(f => `<option value="${f}">${f}</option>`).join('');
+                
+                btn.parentElement.innerHTML = `
+                  <div style="display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; justify-content: flex-end;">
+                    <select id="${selectId}" style="margin-bottom: 0; padding: 0.4rem; max-width: 250px; font-size: 0.8rem;">
+                      ${options}
+                    </select>
+                    <button onclick="downloadSelected('${repoId}', '${selectId}', this)">Download</button>
+                  </div>
+                `;
               } catch (err) {
                 btn.innerText = 'Get Files';
                 btn.disabled = false;
@@ -898,8 +908,14 @@ jobs:
               }
             }
 
+            function downloadSelected(repoId, selectId, btn) {
+              const select = document.getElementById(selectId);
+              const filename = select.value;
+              downloadFile(repoId, filename, btn);
+            }
+
             async function downloadFile(repoId, filename, btn) {
-              showLoading(`Downloading ${filename}...<br><small>This might take a few minutes.</small>`);
+              showLoading(`Downloading ${filename}...<br><small>This might take a few minutes depending on size.</small>`);
               try {
                 const res = await fetch('/api/download-model', {
                   method: 'POST',
