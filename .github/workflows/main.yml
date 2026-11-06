@@ -1,4 +1,4 @@
-name: Custom‑Auth LLM Proxy (Settings & Unload)
+name: Custom‑Auth LLM Proxy
 
 on:
   workflow_dispatch:
@@ -90,7 +90,9 @@ jobs:
           MAX_ATTEMPTS = 10
           MAX_NEW_TOKENS = 4096
           
-          inference_lock = threading.Lock()
+          # THE WAITING SYSTEM: Only allow 1 inference at a time. Others wait in queue.
+          inference_semaphore = asyncio.Semaphore(1)
+          model_lock = threading.Lock()
 
           def get_client_ip(request: Request) -> str:
               cf_ip = request.headers.get("CF-Connecting-IP")
@@ -133,7 +135,7 @@ jobs:
                   self.current_chat_handler: Optional[Any] = None
 
               def load_model(self, model_path: str, model_name: str, n_ctx: int = 4096, n_threads: int = 3):
-                  with inference_lock:
+                  with model_lock:
                       if self.current_llm is not None:
                           self.unload_model()
 
@@ -175,7 +177,7 @@ jobs:
                       self.last_stats = {}
 
               def unload_model(self):
-                  with inference_lock:
+                  with model_lock:
                       if self.current_llm is not None:
                           try:
                               self.current_llm.close()
@@ -187,7 +189,7 @@ jobs:
                           self.last_stats = {}
 
               def generate_sync(self, messages, **kwargs):
-                  with inference_lock:
+                  with model_lock:
                       t0 = time.time()
                       try:
                           result = self.current_llm.create_chat_completion(
@@ -218,7 +220,7 @@ jobs:
               def stream_sync(self, messages, **kwargs) -> AsyncGenerator[str, None]:
                   t0 = time.time()
                   completion_tokens = 0
-                  with inference_lock:
+                  with model_lock:
                       try:
                           for chunk in self.current_llm.create_chat_completion(
                               messages=messages, 
@@ -257,16 +259,20 @@ jobs:
                   yield final
 
               async def generate_async(self, messages, **kwargs):
-                  return await asyncio.to_thread(self.generate_sync, messages, **kwargs)
+                  # WAITING SYSTEM ENFORCED HERE
+                  async with inference_semaphore:
+                      return await asyncio.to_thread(self.generate_sync, messages, **kwargs)
 
               async def stream_async(self, messages, **kwargs) -> AsyncGenerator[str, None]:
-                  for chunk in self.stream_sync(messages, **kwargs):
-                      if "error" in chunk:
+                  # WAITING SYSTEM ENFORCED HERE
+                  async with inference_semaphore:
+                      for chunk in self.stream_sync(messages, **kwargs):
+                          if "error" in chunk:
+                              yield f"data: {json.dumps(chunk)}\n\n"
+                              return
                           yield f"data: {json.dumps(chunk)}\n\n"
-                          return
-                      yield f"data: {json.dumps(chunk)}\n\n"
-                      await asyncio.sleep(0.01)
-                  yield "data: [DONE]\n\n"
+                          await asyncio.sleep(0.01)
+                      yield "data: [DONE]\n\n"
 
           manager = ModelManager()
 
@@ -293,12 +299,18 @@ jobs:
           def get_api_user(request: Request):
               user = request.session.get("user")
               if user: return user
+              
               cfg = load_config()
+              # If auth is disabled in settings, let everyone in
+              if not cfg.get("require_auth", True):
+                  return "anonymous"
+
               stored_key = cfg.get("api_key", "")
               auth = request.headers.get("Authorization", "")
               if stored_key and auth.startswith("Bearer ") and secrets.compare_digest(auth[7:], stored_key):
                   return "api"
-              raise HTTPException(status_code=401, detail="Invalid API key")
+              
+              raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
           # ---------- Setup / Login / Logout ----------
           @app.get("/setup", response_class=HTMLResponse)
@@ -310,7 +322,7 @@ jobs:
           async def setup(request: Request, password: str = Form(...), confirm: str = Form(...)):
               if is_password_set(): return RedirectResponse(url="/login")
               if password != confirm: return templates.TemplateResponse(request, "setup.html", {"error": "Passwords do not match"})
-              save_config({"password_hash": hash_password(password), "api_key": new_api_key()})
+              save_config({"password_hash": hash_password(password), "api_key": new_api_key(), "require_auth": True})
               return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
 
           @app.get("/login", response_class=HTMLResponse)
@@ -352,10 +364,27 @@ jobs:
                   "models": sorted(f.name for f in MODELS_DIR.glob("*.gguf")),
                   "current": manager.current_model_name or "None",
                   "api_key": cfg.get("api_key", ""),
+                  "require_auth": cfg.get("require_auth", True),
                   "base_url": str(request.base_url).rstrip("/"),
                   "last_stats": manager.last_stats,
                   "cpu_count": os.cpu_count() or 4
               })
+
+          @app.post("/api/settings")
+          async def api_settings(request: Request, user: str = Depends(get_user)):
+              try:
+                  body = await request.json()
+                  cfg = load_config()
+                  
+                  if "api_key" in body and body["api_key"]:
+                      cfg["api_key"] = body["api_key"]
+                  if "require_auth" in body:
+                      cfg["require_auth"] = bool(body["require_auth"])
+                      
+                  save_config(cfg)
+                  return {"status": "ok"}
+              except Exception as e:
+                  return JSONResponse(status_code=500, content={"error": str(e)})
 
           @app.post("/regenerate-api-key")
           async def regenerate_api_key(request: Request, user: str = Depends(get_user)):
@@ -717,24 +746,56 @@ jobs:
             {% endif %}
 
             <div class="card">
+              <h2>API Settings</h2>
+              <form id="settingsForm">
+                <label>Custom API Key</label>
+                <div class="input-group">
+                  <input type="text" id="apiKeyInput" value="{{ api_key }}" class="mono">
+                </div>
+                
+                <label style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1.5rem; text-transform: none; font-size: 0.9rem;">
+                  <input type="checkbox" id="requireAuth" {% if require_auth %}checked{% endif %}>
+                  Require API Key for requests (Uncheck for open access)
+                </label>
+
+                <button type="submit" class="btn-secondary">Save Settings</button>
+              </form>
+            </div>
+            <script>
+              document.getElementById('settingsForm').addEventListener('submit', async (e) => {
+                e.preventDefault();
+                showLoading('Saving settings...');
+                try {
+                  const api_key = document.getElementById('apiKeyInput').value;
+                  const require_auth = document.getElementById('requireAuth').checked;
+                  const res = await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ api_key, require_auth })
+                  });
+                  if (!res.ok) throw new Error('Failed to save settings');
+                  window.location.reload();
+                } catch (err) {
+                  alert(err.message);
+                  hideLoading();
+                }
+              });
+            </script>
+
+            <div class="card">
               <h2>API Access</h2>
               <label>Base URL</label>
               <div class="input-group">
                 <input type="text" id="baseUrl" value="{{ base_url }}/v1" readonly class="mono">
                 <button type="button" class="btn-secondary" onclick="copyText('baseUrl', this)">Copy</button>
               </div>
-              <label>API Key</label>
-              <div class="input-group">
-                <input type="password" id="apiKey" value="{{ api_key }}" readonly class="mono">
-                <button type="button" class="btn-secondary" onclick="togglePassword('apiKey', this)">Show</button>
-                <button type="button" class="btn-secondary" onclick="copyText('apiKey', this)">Copy</button>
-              </div>
-              <form method="post" action="/regenerate-api-key" style="margin-top: 0.5rem;">
-                <button type="submit" class="btn-secondary"
-                        onclick="return confirm('Regenerate API key? The old key will stop working immediately.')">
-                  Regenerate API Key
-                </button>
-              </form>
+              <p class="muted" style="font-size: 0.8rem; margin-bottom: 0;">
+                {% if require_auth %}
+                  Auth is required. Use the Bearer token below.
+                {% else %}
+                  Auth is disabled. You can leave the API key blank in your SDK.
+                {% endif %}
+              </p>
             </div>
           </div>
           {% endblock %}
