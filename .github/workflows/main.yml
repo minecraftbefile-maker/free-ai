@@ -1,4 +1,4 @@
-name: Custom‑Auth LLM Proxy with On‑Demand Model Download
+name: Custom‑Auth LLM Proxy (No PyTorch, No oobabooga)
 
 on:
   workflow_dispatch:
@@ -11,64 +11,96 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
-      - name: Add Swap Space for Large Models
+      # Optional: 8G swap to handle 7B Q4 models on the 16GB runner
+      - name: Add Swap Space (8G)
         run: |
-          sudo fallocate -l 20G /mnt/large-swapfile
+          sudo fallocate -l 8G /mnt/large-swapfile
           sudo chmod 600 /mnt/large-swapfile
           sudo mkswap /mnt/large-swapfile
           sudo swapon /mnt/large-swapfile
           free -h
 
-      - name: Clone Text‑Generation‑WebUI
+      - name: Install llama-cpp-python (CPU only) and dependencies
         run: |
-          git clone https://github.com/oobabooga/text-generation-webui.git
-          cd text-generation-webui
+          CMAKE_ARGS="-DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS -DGGML_CUDA=OFF"
+          pip install llama-cpp-python[server] huggingface-hub fastapi uvicorn jinja2 python-multipart itsdangerous passlib[bcrypt]
+          # Verify no PyTorch was installed
+          pip list | grep -i torch || echo "PyTorch is NOT installed (good)"
 
-      - name: Install WebUI Dependencies (CPU)
+      - name: Install cloudflared
         run: |
-          cd text-generation-webui
-          pip install -r requirements.txt
-
-      - name: Install Proxy Dependencies
-        run: |
-          pip install fastapi uvicorn httpx jinja2 python-multipart itsdangerous passlib[bcrypt] huggingface-hub
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared-linux-amd64.deb
 
       - name: Write Custom Proxy Application
         run: |
-          mkdir -p proxy/templates proxy/data
+          mkdir -p proxy/templates proxy/data proxy/models
           cat > proxy/main.py << 'PYEOF'
           import os
           import json
-          import subprocess
-          import httpx
+          import uuid
           from pathlib import Path
+          from typing import Optional
+
           from fastapi import FastAPI, Request, Form, Depends, HTTPException
-          from fastapi.responses import HTMLResponse, RedirectResponse
+          from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
           from fastapi.templating import Jinja2Templates
           from starlette.middleware.sessions import SessionMiddleware
           from starlette.status import HTTP_303_SEE_OTHER
           from passlib.context import CryptContext
-          from huggingface_hub import snapshot_download
+          from huggingface_hub import hf_hub_download
 
-          # --- Configuration ---
-          WEBUI_BASE = "http://localhost:5000"
-          API_KEY = "internal-key-123"
-          ADMIN_KEY = "admin-key-456"
+          from llama_cpp import Llama
+
+          # ---------- Configuration ----------
           SECRET_KEY = "change-this-session-secret"
           CONFIG_FILE = Path("proxy/data/config.json")
-          DOWNLOAD_SCRIPT = Path("../text-generation-webui/download-model.py")
+          MODELS_DIR = Path("proxy/models")
+          MODELS_DIR.mkdir(exist_ok=True)
 
           app = FastAPI()
           app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
           templates = Jinja2Templates(directory="proxy/templates")
           pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-          # --- Helpers ---
+          # ---------- Model Manager ----------
+          class ModelManager:
+              def __init__(self):
+                  self.current_llm: Optional[Llama] = None
+                  self.current_model_name: Optional[str] = None
+
+              def load_model(self, model_path: str, model_name: str):
+                  # Unload previous model first
+                  if self.current_llm is not None:
+                      self.current_llm.close()
+                      self.current_llm = None
+                  self.current_llm = Llama(
+                      model_path=model_path,
+                      n_ctx=4096,
+                      n_threads=os.cpu_count(),
+                      n_gpu_layers=0,          # CPU only
+                      use_mlock=True,          # Lock in RAM
+                      verbose=False
+                  )
+                  self.current_model_name = model_name
+
+              def generate(self, messages, max_tokens=512, temperature=0.7):
+                  if self.current_llm is None:
+                      raise RuntimeError("No model loaded")
+                  return self.current_llm.create_chat_completion(
+                      messages=messages,
+                      max_tokens=max_tokens,
+                      temperature=temperature
+                  )
+
+          manager = ModelManager()
+
+          # ---------- Auth Helpers ----------
           def load_config():
               if CONFIG_FILE.exists():
                   return json.loads(CONFIG_FILE.read_text())
@@ -91,47 +123,7 @@ jobs:
                   raise HTTPException(status_code=303, headers={"Location": "/login"})
               return user
 
-          async def list_models():
-              async with httpx.AsyncClient() as client:
-                  r = await client.get(
-                      f"{WEBUI_BASE}/v1/internal/model/list",
-                      headers={"Authorization": f"Bearer {ADMIN_KEY}"}
-                  )
-                  if r.status_code == 200:
-                      return r.json().get("model_list", [])
-              return []
-
-          async def current_model():
-              async with httpx.AsyncClient() as client:
-                  r = await client.get(
-                      f"{WEBUI_BASE}/v1/internal/model/current",
-                      headers={"Authorization": f"Bearer {ADMIN_KEY}"}
-                  )
-                  if r.status_code == 200:
-                      return r.json().get("model_name", "None")
-              return "Unknown"
-
-          def download_model(model_id: str):
-              """Run download-model.py from the WebUI directory."""
-              cmd = ["python", str(DOWNLOAD_SCRIPT), model_id]
-              result = subprocess.run(cmd, capture_output=True, text=True, cwd=DOWNLOAD_SCRIPT.parent)
-              if result.returncode != 0:
-                  raise RuntimeError(f"Download failed: {result.stderr}")
-              return result.stdout
-
-          async def load_model(model_name: str):
-              async with httpx.AsyncClient() as client:
-                  r = await client.post(
-                      f"{WEBUI_BASE}/v1/internal/model/load",
-                      json={"model_name": model_name},
-                      headers={"Authorization": f"Bearer {ADMIN_KEY}"},
-                      timeout=300.0   # loading a large model may take time
-                  )
-                  if r.status_code != 200:
-                      raise RuntimeError(f"Load failed: {r.text}")
-                  return r.json()
-
-          # --- Setup (first‑time router style) ---
+          # ---------- First‑time Setup (Router‑style) ----------
           @app.get("/setup", response_class=HTMLResponse)
           async def setup_page(request: Request):
               if is_password_set():
@@ -149,7 +141,7 @@ jobs:
               save_config({"password_hash": pwd_context.hash(password)})
               return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
 
-          # --- Login ---
+          # ---------- Login / Logout ----------
           @app.get("/login", response_class=HTMLResponse)
           async def login_page(request: Request):
               if not is_password_set():
@@ -170,60 +162,126 @@ jobs:
               request.session.clear()
               return RedirectResponse(url="/login")
 
-          # --- Dashboard (model selection + download) ---
+          # ---------- Dashboard: Model Selection & Download ----------
           @app.get("/", response_class=HTMLResponse)
           async def dashboard(request: Request, user: str = Depends(get_user)):
-              models = await list_models()
-              current = await current_model()
+              # List local GGUF files
+              local_models = [f.name for f in MODELS_DIR.glob("*.gguf")]
+              current = manager.current_model_name or "None"
               return templates.TemplateResponse(
                   "dashboard.html",
-                  {"request": request, "user": user, "models": models, "current": current}
+                  {"request": request, "user": user, "models": local_models, "current": current}
               )
 
           @app.post("/load-model")
-          async def handle_load_model(request: Request, model_name: str = Form(...), user: str = Depends(get_user)):
-              models = await list_models()
-              if model_name not in models:
-                  # Model not found locally → download it first
-                  try:
-                      download_model(model_name)   # e.g. "TheBloke/Llama-2-7B-GGUF"
-                  except Exception as e:
-                      return templates.TemplateResponse(
-                          "dashboard.html",
-                          {"request": request, "user": user, "models": models,
-                           "current": await current_model(), "error": f"Download failed: {e}"}
-                      )
-                  # Refresh model list after download
-                  models = await list_models()
-              # Load the model (this automatically unloads the previous one)
+          async def load_model(request: Request, model_name: str = Form(...), user: str = Depends(get_user)):
+              model_path = MODELS_DIR / model_name
+              if not model_path.exists():
+                  return templates.TemplateResponse(
+                      "dashboard.html",
+                      {"request": request, "user": user,
+                       "models": [f.name for f in MODELS_DIR.glob("*.gguf")],
+                       "current": manager.current_model_name or "None",
+                       "error": f"Model file '{model_name}' not found locally. Download it first."}
+                  )
               try:
-                  await load_model(model_name)
+                  manager.load_model(str(model_path), model_name)
               except Exception as e:
                   return templates.TemplateResponse(
                       "dashboard.html",
-                      {"request": request, "user": user, "models": models,
-                       "current": await current_model(), "error": f"Load failed: {e}"}
+                      {"request": request, "user": user,
+                       "models": [f.name for f in MODELS_DIR.glob("*.gguf")],
+                       "current": manager.current_model_name or "None",
+                       "error": f"Load failed: {e}"}
                   )
               return RedirectResponse(url="/", status_code=HTTP_303_SEE_OTHER)
 
-          # --- OpenAI‑compatible proxy ---
-          @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
-          async def proxy_openai(path: str, request: Request, user: str = Depends(get_user)):
-              body = await request.body()
-              headers = dict(request.headers)
-              headers["Authorization"] = f"Bearer {API_KEY}"
-              async with httpx.AsyncClient() as client:
-                  r = await client.request(
-                      method=request.method,
-                      url=f"{WEBUI_BASE}/v1/{path}",
-                      headers=headers,
-                      content=body
+          @app.post("/download-model")
+          async def download_model(request: Request, repo_id: str = Form(...), filename: str = Form(...), user: str = Depends(get_user)):
+              try:
+                  # Download directly into the models directory
+                  path = hf_hub_download(
+                      repo_id=repo_id,
+                      filename=filename,
+                      local_dir=str(MODELS_DIR),
+                      local_dir_use_symlinks=False
                   )
-              from starlette.responses import Response
-              return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
+                  # Rename to a clean name if needed (optional)
+                  # The file will already be in MODELS_DIR
+              except Exception as e:
+                  return templates.TemplateResponse(
+                      "dashboard.html",
+                      {"request": request, "user": user,
+                       "models": [f.name for f in MODELS_DIR.glob("*.gguf")],
+                       "current": manager.current_model_name or "None",
+                       "error": f"Download failed: {e}"}
+                  )
+              return RedirectResponse(url="/", status_code=HTTP_303_SEE_OTHER)
+
+          # ---------- OpenAI‑Compatible Endpoints ----------
+          @app.get("/v1/models")
+          async def list_models(user: str = Depends(get_user)):
+              # Return a single model entry representing the currently loaded model
+              model_id = manager.current_model_name or "none"
+              return {
+                  "object": "list",
+                  "data": [
+                      {
+                          "id": model_id,
+                          "object": "model",
+                          "created": 0,
+                          "owned_by": "local"
+                      }
+                  ]
+              }
+
+          @app.post("/v1/chat/completions")
+          async def chat_completions(request: Request, user: str = Depends(get_user)):
+              body = await request.json()
+              messages = body.get("messages", [])
+              max_tokens = body.get("max_tokens", 512)
+              temperature = body.get("temperature", 0.7)
+              try:
+                  response = manager.generate(messages, max_tokens, temperature)
+                  return JSONResponse(content=response)
+              except Exception as e:
+                  raise HTTPException(status_code=500, detail=str(e))
+
+          @app.post("/v1/completions")
+          async def completions(request: Request, user: str = Depends(get_user)):
+              body = await request.json()
+              prompt = body.get("prompt", "")
+              max_tokens = body.get("max_tokens", 512)
+              temperature = body.get("temperature", 0.7)
+              # Convert prompt to chat format for simplicity
+              messages = [{"role": "user", "content": prompt}]
+              try:
+                  response = manager.generate(messages, max_tokens, temperature)
+                  # Adapt to completion format
+                  completion_response = {
+                      "id": f"cmpl-{uuid.uuid4()}",
+                      "object": "text_completion",
+                      "created": 0,
+                      "model": manager.current_model_name or "none",
+                      "choices": [{
+                          "text": response["choices"][0]["message"]["content"],
+                          "index": 0,
+                          "logprobs": None,
+                          "finish_reason": "stop"
+                      }],
+                      "usage": response.get("usage", {})
+                  }
+                  return JSONResponse(content=completion_response)
+              except Exception as e:
+                  raise HTTPException(status_code=500, detail=str(e))
+
+          # ---------- Health ----------
+          @app.get("/health")
+          async def health():
+              return {"status": "ok", "model": manager.current_model_name or "none"}
           PYEOF
 
-          # --- Setup template ---
+          # ---------- Templates ----------
           cat > proxy/templates/setup.html << 'HTMLEOF'
           <!DOCTYPE html>
           <html>
@@ -240,7 +298,6 @@ jobs:
           </html>
           HTMLEOF
 
-          # --- Login template ---
           cat > proxy/templates/login.html << 'HTMLEOF'
           <!DOCTYPE html>
           <html>
@@ -256,7 +313,6 @@ jobs:
           </html>
           HTMLEOF
 
-          # --- Dashboard template (with download capability) ---
           cat > proxy/templates/dashboard.html << 'HTMLEOF'
           <!DOCTYPE html>
           <html>
@@ -264,7 +320,6 @@ jobs:
           <body>
             <h2>Welcome, {{ user }}! <a href="/logout">Logout</a></h2>
             <p><strong>Current model:</strong> {{ current }}</p>
-
             {% if error %}<p style="color:red">{{ error }}</p>{% endif %}
 
             <h3>Load an existing model</h3>
@@ -279,12 +334,13 @@ jobs:
 
             <hr>
 
-            <h3>Download & load a new model</h3>
-            <form method="post" action="/load-model">
-              <input name="model_name" placeholder="e.g. TheBloke/Llama-2-7B-GGUF" size="50" required>
-              <button type="submit">Download & Load</button>
+            <h3>Download a new model from Hugging Face</h3>
+            <form method="post" action="/download-model">
+              <input name="repo_id" placeholder="e.g. TheBloke/Llama-2-7B-GGUF" size="50" required><br>
+              <input name="filename" placeholder="e.g. llama-2-7b.Q4_K_M.gguf" size="50" required><br>
+              <button type="submit">Download</button>
             </form>
-            <p><small>If the model is not present locally, it will be downloaded from Hugging Face and then loaded. The previously loaded model will be unloaded automatically.</small></p>
+            <p><small>After downloading, the file will appear in the list above. Then select it and click "Load".</small></p>
 
             <hr>
             <p>OpenAI‑SDK endpoint: <code>https://&lt;your‑tunnel&gt;/v1</code></p>
@@ -293,33 +349,12 @@ jobs:
           </html>
           HTMLEOF
 
-      - name: Start Text‑Generation‑WebUI (OpenAI extension)
-        run: |
-          cd text-generation-webui
-          nohup python server.py \
-            --listen \
-            --cpu \
-            --loader llamacpp \
-            --api \
-            --api-port 5000 \
-            --api-key "internal-key-123" \
-            --admin-key "admin-key-456" \
-            --extensions openai \
-            > webui.log 2>&1 &
-          echo $! > webui.pid
-          sleep 30
-
       - name: Start Custom Proxy
         run: |
           cd proxy
           nohup uvicorn main:app --host 0.0.0.0 --port 8000 > proxy.log 2>&1 &
           echo $! > proxy.pid
           sleep 5
-
-      - name: Install cloudflared
-        run: |
-          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared-linux-amd64.deb
 
       - name: Expose via Cloudflare Tunnel
         run: |
