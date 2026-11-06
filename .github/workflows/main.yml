@@ -1,4 +1,4 @@
-name: Custom‑Auth LLM Proxy (Streaming, Tools, Speed Metrics)
+name: Custom‑Auth LLM Proxy (Model Store, Vision Support)
 
 on:
   workflow_dispatch:
@@ -53,16 +53,18 @@ jobs:
           import time
           import traceback
           from pathlib import Path
-          from typing import Optional, AsyncGenerator
+          from typing import Optional, AsyncGenerator, List, Dict, Any
 
-          from fastapi import FastAPI, Request, Form, Depends, HTTPException
+          from fastapi import FastAPI, Request, Form, Depends, HTTPException, Query
           from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
           from fastapi.templating import Jinja2Templates
           from starlette.middleware.sessions import SessionMiddleware
           from starlette.status import HTTP_303_SEE_OTHER
-          from huggingface_hub import hf_hub_download
+          from huggingface_hub import hf_hub_download, HfApi, ModelInfo
+          from huggingface_hub.hf_api import RepoSibling
 
           from llama_cpp import Llama
+          from llama_cpp.llama_chat_format import MTMDChatHandler, Llava15ChatHandler, Llama3VisionAlphaChatHandler, Qwen25VLChatHandler
 
           # ---------- Configuration ----------
           BASE_DIR = Path(__file__).parent.resolve()
@@ -103,12 +105,13 @@ jobs:
           def new_api_key() -> str:
               return "sk-" + secrets.token_hex(24)
 
-          # ---------- Model Manager ----------
+          # ---------- Model Manager (with Vision Support) ----------
           class ModelManager:
               def __init__(self):
                   self.current_llm: Optional[Llama] = None
                   self.current_model_name: Optional[str] = None
                   self.last_stats: dict = {}
+                  self.current_chat_handler: Optional[Any] = None
 
               def load_model(self, model_path: str, model_name: str):
                   if self.current_llm is not None:
@@ -117,27 +120,43 @@ jobs:
                       except Exception:
                           pass
                       self.current_llm = None
+                      self.current_chat_handler = None
+
+                  # Detect if this is a vision model by checking the filename or metadata
+                  is_vision = any(tag in model_name.lower() for tag in ["vision", "vl", "llava", "qwen2.5-vl", "gemma-4"])
+                  chat_handler = None
+                  if is_vision:
+                      # Try to use generic MTMD handler (works for embedded projectors)
+                      # If it fails, the user will see an error in the logs.
+                      try:
+                          chat_handler = MTMDChatHandler()
+                          print(f"[vision] Using MTMDChatHandler for {model_name}", flush=True)
+                      except Exception as e:
+                          print(f"[vision] MTMD handler init failed: {e}. Falling back to default.", flush=True)
+                          chat_handler = None
+
                   self.current_llm = Llama(
                       model_path=model_path,
                       n_ctx=4096,
                       n_threads=os.cpu_count() or 4,
                       n_gpu_layers=0,
                       use_mlock=True,
-                      verbose=False
+                      verbose=False,
+                      chat_handler=chat_handler,
                   )
                   self.current_model_name = model_name
+                  self.current_chat_handler = chat_handler
                   self.last_stats = {}
 
               def generate(self, messages, **kwargs):
-                  """Non‑streaming. Accepts all OpenAI params (tools, tool_choice, etc.)."""
                   if self.current_llm is None:
                       raise RuntimeError("No model loaded")
                   t0 = time.time()
+                  # Remove unsupported kwargs for vision models if necessary
                   result = self.current_llm.create_chat_completion(messages=messages, **kwargs)
                   elapsed = time.time() - t0
                   if isinstance(result, dict):
                       result["model"] = self.current_model_name
-                      # Compute t/s
                       usage = result.get("usage", {})
                       timings = result.get("timings", {})
                       completion_tokens = usage.get("completion_tokens", 0)
@@ -153,7 +172,6 @@ jobs:
                   return result
 
               def stream(self, messages, **kwargs) -> AsyncGenerator[str, None]:
-                  """Streaming. Yields OpenAI‑compatible SSE events + final usage chunk."""
                   if self.current_llm is None:
                       raise RuntimeError("No model loaded")
                   t0 = time.time()
@@ -161,7 +179,6 @@ jobs:
                   for chunk in self.current_llm.create_chat_completion(messages=messages, stream=True, **kwargs):
                       if isinstance(chunk, dict):
                           chunk["model"] = self.current_model_name
-                          # Count tokens (each delta is roughly one token)
                           if chunk.get("choices"):
                               delta = chunk["choices"][0].get("delta", {})
                               if delta.get("content") or delta.get("tool_calls"):
@@ -175,7 +192,6 @@ jobs:
                       "completion_tokens": completion_tokens,
                       "tokens_per_second": round(tps, 2),
                   }
-                  # Final usage chunk (OpenAI sends a chunk with empty choices + usage)
                   final = {
                       "id": f"chatcmpl-{uuid.uuid4()}",
                       "object": "chat.completion.chunk",
@@ -328,6 +344,80 @@ jobs:
                   })
               return RedirectResponse(url="/", status_code=HTTP_303_SEE_OTHER)
 
+          # ---------- MODEL STORE ----------
+          @app.get("/store", response_class=HTMLResponse)
+          async def store_page(
+              request: Request,
+              user: str = Depends(get_user),
+              vision_only: bool = Query(False),
+              search: str = Query(""),
+          ):
+              api = HfApi()
+              # Build filters
+              filters = ["gguf"]
+              if vision_only:
+                  filters.append("vision")  # This is a heuristic; may not be a standard tag
+              try:
+                  models = api.list_models(
+                      filter=filters,
+                      sort="downloads",
+                      direction=-1,
+                      limit=30,
+                      search=search,
+                      expand=["siblings", "tags", "downloads", "pipeline_tag"],
+                  )
+              except Exception as e:
+                  models = []
+                  print(f"[store] HF API error: {e}", flush=True)
+
+              # Process models: keep only single-file GGUF (no shards) and optionally vision
+              processed = []
+              for m in models:
+                  siblings = m.siblings or []
+                  gguf_files = [s.rfilename for s in siblings if s.rfilename.endswith(".gguf")]
+                  # Single-file: exactly one .gguf, and no files ending in -00001-of-0000X
+                  if len(gguf_files) != 1:
+                      continue
+                  filename = gguf_files[0]
+                  if "-of-" in filename:  # sharded model
+                      continue
+                  # Vision detection: check tags or filename for vision/multimodal indicators
+                  is_vision = any(t in (m.tags or []) for t in ["vision", "multimodal", "image-text-to-text"])
+                  if not is_vision:
+                      # also check filename
+                      is_vision = any(k in filename.lower() for k in ["vision", "vl", "llava", "qwen2.5-vl"])
+                  if vision_only and not is_vision:
+                      continue
+                  processed.append({
+                      "id": m.id,
+                      "downloads": m.downloads,
+                      "tags": m.tags,
+                      "filename": filename,
+                      "is_vision": is_vision,
+                      "pipeline_tag": m.pipeline_tag,
+                  })
+
+              return templates.TemplateResponse(request, "store.html", {
+                  "user": user,
+                  "models": processed,
+                  "vision_only": vision_only,
+                  "search": search,
+              })
+
+          @app.post("/store/download")
+          async def store_download(
+              request: Request,
+              repo_id: str = Form(...),
+              filename: str = Form(...),
+              user: str = Depends(get_user),
+          ):
+              try:
+                  hf_hub_download(repo_id=repo_id, filename=filename, local_dir=str(MODELS_DIR))
+              except Exception as e:
+                  # Redirect back to store with an error query param
+                  return RedirectResponse(url=f"/store?error={e}", status_code=HTTP_303_SEE_OTHER)
+              return RedirectResponse(url="/", status_code=HTTP_303_SEE_OTHER)
+
           # ---------- OpenAI-compatible ----------
           @app.get("/v1/models")
           async def list_models(user: str = Depends(get_api_user)):
@@ -339,9 +429,6 @@ jobs:
               body = await request.json()
               messages = body.pop("messages", [])
               stream = body.pop("stream", False)
-              # Extract all OpenAI params (tools, tool_choice, functions, function_call,
-              # response_format, temperature, top_p, max_tokens, stop, presence_penalty, etc.)
-              # and pass them through to llama-cpp-python.
               try:
                   if stream:
                       return StreamingResponse(
@@ -451,6 +538,8 @@ jobs:
                 border: 1px solid rgba(16, 185, 129, 0.3); }
               .badge.notloaded { background: rgba(148, 163, 184, 0.1); color: var(--text-muted);
                 border: 1px solid rgba(148, 163, 184, 0.2); }
+              .badge.vision { background: rgba(139, 92, 246, 0.15); color: #a78bfa;
+                border: 1px solid rgba(139, 92, 246, 0.3); }
               .mono-large { font-family: 'SF Mono', monospace; font-size: 0.9rem; color: var(--text);
                 word-break: break-all; padding: 0.75rem; background: rgba(15, 23, 42, 0.8);
                 border-radius: 8px; border: 1px solid var(--border); }
@@ -468,6 +557,17 @@ jobs:
               .stat .label { font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase;
                 letter-spacing: 0.05em; margin-top: 0.25rem; }
               .stat .value.tps { color: var(--success); }
+              .model-item { display: flex; justify-content: space-between; align-items: center;
+                padding: 0.75rem; border-bottom: 1px solid var(--border); }
+              .model-item:last-child { border-bottom: none; }
+              .model-info { flex: 1; min-width: 0; }
+              .model-name { font-weight: 600; font-size: 0.9rem; word-break: break-all; }
+              .model-meta { font-size: 0.75rem; color: var(--text-muted); margin-top: 0.25rem; }
+              .model-actions { flex-shrink: 0; margin-left: 1rem; }
+              .nav-link { color: var(--text-muted); text-decoration: none; font-size: 0.875rem;
+                padding: 0.5rem 1rem; border-radius: 8px; transition: all 0.15s; }
+              .nav-link:hover { background: rgba(148, 163, 184, 0.1); color: var(--text); }
+              .nav-link.active { background: rgba(59, 130, 246, 0.1); color: var(--primary); }
             </style>
           </head>
           <body>
@@ -529,6 +629,8 @@ jobs:
             <div class="header">
               <div class="logo">🚀 <span>LLM Proxy</span></div>
               <div class="row">
+                <a href="/" class="nav-link active">Dashboard</a>
+                <a href="/store" class="nav-link">Model Store</a>
                 <span class="muted" style="margin: 0;">{{ user }}</span>
                 <a href="/logout" class="btn btn-secondary">Logout</a>
               </div>
@@ -583,7 +685,7 @@ jobs:
             {% endif %}
 
             <div class="card">
-              <h2>Download from Hugging Face</h2>
+              <h2>Download from Hugging Face (Manual)</h2>
               <form method="post" action="/download-model">
                 <label>Repository ID</label>
                 <input type="text" name="repo_id" placeholder="TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF" required>
@@ -627,6 +729,66 @@ jobs:
               });
             }
           </script>
+          {% endblock %}
+          HTMLEOF
+
+          # ---------- store.html ----------
+          cat > proxy/templates/store.html << 'HTMLEOF'
+          {% extends "base.html" %}
+          {% block title %}Model Store{% endblock %}
+          {% block body %}
+          <div class="container">
+            <div class="header">
+              <div class="logo">🚀 <span>LLM Proxy</span></div>
+              <div class="row">
+                <a href="/" class="nav-link">Dashboard</a>
+                <a href="/store" class="nav-link active">Model Store</a>
+                <span class="muted" style="margin: 0;">{{ user }}</span>
+                <a href="/logout" class="btn btn-secondary">Logout</a>
+              </div>
+            </div>
+
+            <div class="card">
+              <h2>Discover Models</h2>
+              <p class="muted">Browse single-file GGUF models from Hugging Face. Vision models with embedded projectors are supported.</p>
+              <form method="get" action="/store" class="row" style="margin-bottom: 1rem;">
+                <input type="text" name="search" value="{{ search }}" placeholder="Search model name..." style="margin-bottom: 0;">
+                <label style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0; text-transform: none; font-size: 0.9rem;">
+                  <input type="checkbox" name="vision_only" value="true" {% if vision_only %}checked{% endif %}>
+                  Vision only
+                </label>
+                <button type="submit">Search</button>
+              </form>
+            </div>
+
+            {% if models %}
+            <div class="card">
+              <h2>Results ({{ models|length }})</h2>
+              {% for m in models %}
+              <div class="model-item">
+                <div class="model-info">
+                  <div class="model-name">{{ m.id }}</div>
+                  <div class="model-meta">
+                    {{ m.filename }} · {{ m.downloads }} downloads
+                    {% if m.is_vision %}<span class="badge vision" style="margin-left: 0.5rem;">Vision</span>{% endif %}
+                  </div>
+                </div>
+                <div class="model-actions">
+                  <form method="post" action="/store/download" style="display: inline;">
+                    <input type="hidden" name="repo_id" value="{{ m.id }}">
+                    <input type="hidden" name="filename" value="{{ m.filename }}">
+                    <button type="submit" class="btn-secondary">Download</button>
+                  </form>
+                </div>
+              </div>
+              {% endfor %}
+            </div>
+            {% else %}
+            <div class="card">
+              <p class="muted">No models found. Try adjusting your search or filters.</p>
+            </div>
+            {% endif %}
+          </div>
           {% endblock %}
           HTMLEOF
 
