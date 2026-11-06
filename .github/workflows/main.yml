@@ -1,4 +1,4 @@
-name: Custom‑Auth LLM Proxy (CPU Throttling & 4096 Context)
+name: Custom‑Auth LLM Proxy (Settings & Unload)
 
 on:
   workflow_dispatch:
@@ -84,7 +84,7 @@ jobs:
           templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
           hf_api = HfApi()
 
-          # ---------- Safety & Concurrency Tracking ----------
+          # ---------- Security & Concurrency Tracking ----------
           failed_logins: Dict[str, int] = {}
           banned_ips: set = set()
           MAX_ATTEMPTS = 10
@@ -132,15 +132,10 @@ jobs:
                   self.last_stats: dict = {}
                   self.current_chat_handler: Optional[Any] = None
 
-              def load_model(self, model_path: str, model_name: str):
+              def load_model(self, model_path: str, model_name: str, n_ctx: int = 4096, n_threads: int = 3):
                   with inference_lock:
                       if self.current_llm is not None:
-                          try:
-                              self.current_llm.close()
-                          except Exception:
-                              pass
-                          self.current_llm = None
-                          self.current_chat_handler = None
+                          self.unload_model()
 
                       is_vision = any(tag in model_name.lower() for tag in ["vision", "vl", "llava", "qwen2.5-vl", "gemma-4"])
                       chat_handler = None
@@ -148,19 +143,14 @@ jobs:
                       if is_vision and MTMDChatHandler is not None:
                           try:
                               chat_handler = MTMDChatHandler()
-                              print(f"[vision] Using MTMDChatHandler for {model_name}", flush=True)
                           except Exception as e:
-                              print(f"[vision] MTMD handler init failed: {e}. Will fallback.", flush=True)
+                              print(f"[vision] MTMD handler init failed: {e}.", flush=True)
 
                       try:
-                          # THROTTLING: Leaving 1 CPU core free for the web server
-                          safe_threads = max(1, (os.cpu_count() or 4) - 1)
-                          print(f"[load] Loading {model_name} with {safe_threads} threads.", flush=True)
-                          
                           self.current_llm = Llama(
                               model_path=model_path,
-                              n_ctx=4096, # Restored to 4096
-                              n_threads=safe_threads, 
+                              n_ctx=n_ctx,
+                              n_threads=n_threads,
                               n_gpu_layers=0,
                               use_mlock=True,
                               verbose=False,
@@ -168,11 +158,10 @@ jobs:
                           )
                       except Exception as e:
                           if chat_handler is not None:
-                              print(f"[vision] Load with MTMD failed: {e}. Retrying as text-only.", flush=True)
                               self.current_llm = Llama(
                                   model_path=model_path,
-                                  n_ctx=4096,
-                                  n_threads=safe_threads,
+                                  n_ctx=n_ctx,
+                                  n_threads=n_threads,
                                   n_gpu_layers=0,
                                   use_mlock=True,
                                   verbose=False,
@@ -185,8 +174,19 @@ jobs:
                       self.current_chat_handler = chat_handler
                       self.last_stats = {}
 
+              def unload_model(self):
+                  with inference_lock:
+                      if self.current_llm is not None:
+                          try:
+                              self.current_llm.close()
+                          except Exception:
+                              pass
+                          self.current_llm = None
+                          self.current_chat_handler = None
+                          self.current_model_name = None
+                          self.last_stats = {}
+
               def generate_sync(self, messages, **kwargs):
-                  """Synchronous generation to be run in a thread."""
                   with inference_lock:
                       t0 = time.time()
                       try:
@@ -196,8 +196,7 @@ jobs:
                               **{k: v for k, v in kwargs.items() if k != "max_tokens"}
                           )
                       except Exception as e:
-                          print(f"[ERROR] Inference failed: {e}", flush=True)
-                          raise RuntimeError(f"Model crashed or context limit exceeded: {str(e)}")
+                          raise RuntimeError(f"Model crashed: {str(e)}")
                           
                       elapsed = time.time() - t0
                       if isinstance(result, dict):
@@ -217,10 +216,8 @@ jobs:
                       return result
 
               def stream_sync(self, messages, **kwargs) -> AsyncGenerator[str, None]:
-                  """Synchronous streaming generator. Will be yielded asynchronously."""
                   t0 = time.time()
                   completion_tokens = 0
-                  
                   with inference_lock:
                       try:
                           for chunk in self.current_llm.create_chat_completion(
@@ -237,7 +234,6 @@ jobs:
                                           completion_tokens += 1
                               yield chunk
                       except Exception as e:
-                          print(f"[ERROR] Streaming failed: {e}", flush=True)
                           yield {"error": str(e)}
                           return
                   
@@ -255,35 +251,21 @@ jobs:
                       "created": int(time.time()),
                       "model": self.current_model_name,
                       "choices": [],
-                      "usage": {
-                          "prompt_tokens": 0,
-                          "completion_tokens": completion_tokens,
-                          "total_tokens": completion_tokens,
-                      },
+                      "usage": {"prompt_tokens": 0, "completion_tokens": completion_tokens, "total_tokens": completion_tokens},
                       "timings": self.last_stats,
                   }
                   yield final
 
               async def generate_async(self, messages, **kwargs):
-                  """Run synchronous generation in a background thread."""
-                  if self.current_llm is None:
-                      raise RuntimeError("No model loaded")
                   return await asyncio.to_thread(self.generate_sync, messages, **kwargs)
 
               async def stream_async(self, messages, **kwargs) -> AsyncGenerator[str, None]:
-                  """Async wrapper around the synchronous stream, adding a slow-down delay."""
-                  if self.current_llm is None:
-                      raise RuntimeError("No model loaded")
-                  
-                  # THROTTLING: Yield to event loop, allowing web server to breathe
                   for chunk in self.stream_sync(messages, **kwargs):
                       if "error" in chunk:
                           yield f"data: {json.dumps(chunk)}\n\n"
                           return
                       yield f"data: {json.dumps(chunk)}\n\n"
-                      # THE SAFETY SLOW-DOWN LAYER:
-                      await asyncio.sleep(0.01) 
-                  
+                      await asyncio.sleep(0.01)
                   yield "data: [DONE]\n\n"
 
           manager = ModelManager()
@@ -310,54 +292,38 @@ jobs:
 
           def get_api_user(request: Request):
               user = request.session.get("user")
-              if user:
-                  return user
+              if user: return user
               cfg = load_config()
               stored_key = cfg.get("api_key", "")
               auth = request.headers.get("Authorization", "")
               if stored_key and auth.startswith("Bearer ") and secrets.compare_digest(auth[7:], stored_key):
                   return "api"
-              raise HTTPException(
-                  status_code=401,
-                  detail={"error": {"message": "Invalid or missing API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
-                  headers={"WWW-Authenticate": "Bearer"},
-              )
+              raise HTTPException(status_code=401, detail="Invalid API key")
 
           # ---------- Setup / Login / Logout ----------
           @app.get("/setup", response_class=HTMLResponse)
           async def setup_page(request: Request):
-              if is_password_set():
-                  return RedirectResponse(url="/login")
+              if is_password_set(): return RedirectResponse(url="/login")
               return templates.TemplateResponse(request, "setup.html", {})
 
           @app.post("/setup")
           async def setup(request: Request, password: str = Form(...), confirm: str = Form(...)):
-              if is_password_set():
-                  return RedirectResponse(url="/login")
-              if password != confirm:
-                  return templates.TemplateResponse(request, "setup.html", {"error": "Passwords do not match"})
-              if len(password) < 4:
-                  return templates.TemplateResponse(request, "setup.html", {"error": "Password too short (min 4 chars)"})
+              if is_password_set(): return RedirectResponse(url="/login")
+              if password != confirm: return templates.TemplateResponse(request, "setup.html", {"error": "Passwords do not match"})
               save_config({"password_hash": hash_password(password), "api_key": new_api_key()})
               return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
 
           @app.get("/login", response_class=HTMLResponse)
           async def login_page(request: Request):
-              if not is_password_set():
-                  return RedirectResponse(url="/setup")
-              ip = get_client_ip(request)
-              if ip in banned_ips:
-                  return HTMLResponse("<h2>403 Forbidden</h2><p>Your IP has been banned due to too many failed login attempts.</p>", status_code=403)
+              if not is_password_set(): return RedirectResponse(url="/setup")
+              if get_client_ip(request) in banned_ips: return HTMLResponse("Banned", status_code=403)
               return templates.TemplateResponse(request, "login.html", {})
 
           @app.post("/login")
           async def login(request: Request, password: str = Form(...)):
-              if not is_password_set():
-                  return RedirectResponse(url="/setup")
-              
+              if not is_password_set(): return RedirectResponse(url="/setup")
               ip = get_client_ip(request)
-              if ip in banned_ips:
-                  return HTMLResponse("<h2>403 Forbidden</h2><p>Your IP has been banned due to too many failed login attempts.</p>", status_code=403)
+              if ip in banned_ips: return HTMLResponse("Banned", status_code=403)
 
               cfg = load_config()
               if check_password(password, cfg.get("password_hash", "")):
@@ -367,14 +333,10 @@ jobs:
               
               failed_logins[ip] = failed_logins.get(ip, 0) + 1
               remaining = MAX_ATTEMPTS - failed_logins[ip]
-              
               if failed_logins[ip] >= MAX_ATTEMPTS:
                   banned_ips.add(ip)
-                  return HTMLResponse("<h2>403 Forbidden</h2><p>Too many failed attempts. Your IP has been banned.</p>", status_code=403)
-              
-              return templates.TemplateResponse(request, "login.html", {
-                  "error": f"Wrong password. {remaining} attempts remaining."
-              })
+                  return HTMLResponse("<h2>403 Forbidden</h2><p>Too many failed attempts. IP banned.</p>", status_code=403)
+              return templates.TemplateResponse(request, "login.html", {"error": f"Wrong password. {remaining} attempts left."})
 
           @app.get("/logout")
           async def logout(request: Request):
@@ -392,6 +354,7 @@ jobs:
                   "api_key": cfg.get("api_key", ""),
                   "base_url": str(request.base_url).rstrip("/"),
                   "last_stats": manager.last_stats,
+                  "cpu_count": os.cpu_count() or 4
               })
 
           @app.post("/regenerate-api-key")
@@ -406,21 +369,25 @@ jobs:
               try:
                   body = await request.json()
                   model_name = body.get("model_name")
+                  n_ctx = int(body.get("n_ctx", 4096))
+                  n_threads = int(body.get("n_threads", 3))
                   model_path = MODELS_DIR / model_name
-                  if not model_path.exists():
-                      return JSONResponse(status_code=404, content={"error": f"Model '{model_name}' not found."})
-                  await asyncio.to_thread(manager.load_model, str(model_path), model_name)
+                  if not model_path.exists(): return JSONResponse(status_code=404, content={"error": "Model not found"})
+                  await asyncio.to_thread(manager.load_model, str(model_path), model_name, n_ctx, n_threads)
                   return {"status": "ok"}
               except Exception as e:
                   return JSONResponse(status_code=500, content={"error": str(e)})
+
+          @app.post("/api/unload-model")
+          async def api_unload_model(user: str = Depends(get_user)):
+              await asyncio.to_thread(manager.unload_model)
+              return {"status": "ok"}
 
           @app.post("/api/download-model")
           async def api_download_model(request: Request, user: str = Depends(get_user)):
               try:
                   body = await request.json()
-                  repo_id = body.get("repo_id")
-                  filename = body.get("filename")
-                  await asyncio.to_thread(hf_hub_download, repo_id=repo_id, filename=filename, local_dir=str(MODELS_DIR))
+                  await asyncio.to_thread(hf_hub_download, repo_id=body.get("repo_id"), filename=body.get("filename"), local_dir=str(MODELS_DIR))
                   return {"status": "ok"}
               except Exception as e:
                   return JSONResponse(status_code=500, content={"error": str(e)})
@@ -433,29 +400,12 @@ jobs:
           @app.get("/api/store/search")
           async def api_store_search(q: str = "", vision_only: bool = False):
               try:
-                  models = await asyncio.to_thread(
-                      hf_api.list_models,
-                      search=q,
-                      filter="gguf",
-                      sort="downloads",
-                      limit=30,
-                      expand=["tags"]
-                  )
-                  
+                  models = await asyncio.to_thread(hf_api.list_models, search=q, filter="gguf", sort="downloads", limit=30, expand=["tags"])
                   results = []
                   for m in models:
-                      is_vision = any(t in (m.tags or []) for t in ["vision", "multimodal", "image-text-to-text"])
-                      if not is_vision:
-                          is_vision = any(k in m.id.lower() for k in ["vision", "vl", "llava", "qwen2.5-vl"])
-                          
-                      if vision_only and not is_vision:
-                          continue
-                          
-                      results.append({
-                          "id": m.id,
-                          "downloads": m.downloads,
-                          "is_vision": is_vision,
-                      })
+                      is_vision = any(t in (m.tags or []) for t in ["vision", "multimodal", "image-text-to-text"]) or any(k in m.id.lower() for k in ["vision", "vl", "llava", "qwen2.5-vl"])
+                      if vision_only and not is_vision: continue
+                      results.append({"id": m.id, "downloads": m.downloads, "is_vision": is_vision})
                   return results
               except Exception as e:
                   return JSONResponse(status_code=500, content={"error": str(e)})
@@ -464,21 +414,16 @@ jobs:
           async def api_store_files(repo_id: str):
               try:
                   files = await asyncio.to_thread(hf_api.list_repo_files, repo_id=repo_id)
-                  gguf_files = [f for f in files if f.endswith(".gguf")]
-                  
-                  if not gguf_files:
-                      return {"repo_id": repo_id, "files": [], "error": "No GGUF files found in this repo."}
-                  
-                  gguf_files.sort()
+                  gguf_files = sorted([f for f in files if f.endswith(".gguf")])
+                  if not gguf_files: return {"repo_id": repo_id, "files": [], "error": "No GGUF files found."}
                   return {"repo_id": repo_id, "files": gguf_files}
               except Exception as e:
                   return JSONResponse(status_code=500, content={"error": str(e)})
 
-          # ---------- OpenAI-compatible (with Safety Layer) ----------
+          # ---------- OpenAI-compatible ----------
           @app.get("/v1/models")
           async def list_models(user: str = Depends(get_api_user)):
-              model_id = manager.current_model_name or "none"
-              return {"object": "list", "data": [{"id": model_id, "object": "model", "created": 0, "owned_by": "local"}]}
+              return {"object": "list", "data": [{"id": manager.current_model_name or "none", "object": "model", "created": 0, "owned_by": "local"}]}
 
           @app.post("/v1/chat/completions")
           async def chat_completions(request: Request, user: str = Depends(get_api_user)):
@@ -486,14 +431,8 @@ jobs:
               messages = body.pop("messages", [])
               stream = body.pop("stream", False)
               try:
-                  if stream:
-                      return StreamingResponse(
-                          manager.stream_async(messages, **body),
-                          media_type="text/event-stream",
-                          headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
-                      )
-                  result = await manager.generate_async(messages, **body)
-                  return JSONResponse(content=result)
+                  if stream: return StreamingResponse(manager.stream_async(messages, **body), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+                  return JSONResponse(content=await manager.generate_async(messages, **body))
               except Exception as e:
                   return JSONResponse(status_code=500, content={"error": str(e)})
 
@@ -542,7 +481,7 @@ jobs:
               .card-header h2 { margin: 0; }
               label { display: block; font-size: 0.75rem; margin-bottom: 0.5rem;
                 color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
-              input[type=text], input[type=password], select {
+              input[type=text], input[type=password], select, input[type=number] {
                 width: 100%; padding: 0.7rem 1rem; background: rgba(15, 23, 42, 0.8);
                 border: 1px solid var(--border); border-radius: 8px; color: var(--text);
                 font-size: 0.95rem; margin-bottom: 1rem; transition: all 0.15s; font-family: inherit; }
@@ -557,6 +496,7 @@ jobs:
               button:active { transform: translateY(0); }
               button.secondary, .btn-secondary { background: var(--surface-2); color: var(--text); }
               button.secondary:hover, .btn-secondary:hover { background: #475569; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2); }
+              button.danger { background: linear-gradient(135deg, #ef4444, #b91c1c); }
               .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 8px;
                 text-decoration: none; font-size: 0.875rem; font-weight: 500; transition: all 0.15s; }
               .row { display: flex; gap: 0.75rem; align-items: center; }
@@ -568,94 +508,43 @@ jobs:
                 border-radius: 8px; margin-bottom: 1rem; }
               .badge { display: inline-block; padding: 0.3rem 0.75rem; border-radius: 999px;
                 font-size: 0.75rem; font-weight: 600; letter-spacing: 0.02em; }
-              .badge.loaded { background: rgba(16, 185, 129, 0.15); color: var(--success);
-                border: 1px solid rgba(16, 185, 129, 0.3); }
-              .badge.notloaded { background: rgba(148, 163, 184, 0.1); color: var(--text-muted);
-                border: 1px solid rgba(148, 163, 184, 0.2); }
-              .badge.vision { background: rgba(139, 92, 246, 0.15); color: #a78bfa;
-                border: 1px solid rgba(139, 92, 246, 0.3); }
-              .badge.warning { background: rgba(245, 158, 11, 0.15); color: var(--warning);
-                border: 1px solid rgba(245, 158, 11, 0.3); }
+              .badge.loaded { background: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.3); }
+              .badge.notloaded { background: rgba(148, 163, 184, 0.1); color: var(--text-muted); border: 1px solid rgba(148, 163, 184, 0.2); }
+              .badge.vision { background: rgba(139, 92, 246, 0.15); color: #a78bfa; border: 1px solid rgba(139, 92, 246, 0.3); }
               .mono-large { font-family: 'SF Mono', monospace; font-size: 0.9rem; color: var(--text);
                 word-break: break-all; padding: 0.75rem; background: rgba(15, 23, 42, 0.8);
-                border-radius: 8px; border: 1px solid var(--border); }
-              .hint { font-size: 0.8rem; color: var(--text-muted); margin-top: 0.75rem; }
-              .hint code { background: rgba(59, 130, 246, 0.1); color: #93c5fd;
-                padding: 0.15rem 0.5rem; border-radius: 4px; font-family: 'SF Mono', monospace; font-size: 0.8rem; }
+                border-radius: 8px; border: 1px solid var(--border); margin-bottom: 1rem; }
               .auth-wrap { max-width: 400px; margin: 6rem auto 2rem; }
               .auth-wrap .logo { text-align: center; margin-bottom: 1.5rem; font-size: 1.75rem; }
               .auth-wrap .card { padding: 2rem; }
               .muted { color: var(--text-muted); font-size: 0.9rem; margin-bottom: 1rem; }
               .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.75rem; }
-              .stat { background: rgba(15, 23, 42, 0.6); padding: 0.75rem; border-radius: 8px;
-                border: 1px solid var(--border); text-align: center; }
+              .stat { background: rgba(15, 23, 42, 0.6); padding: 0.75rem; border-radius: 8px; border: 1px solid var(--border); text-align: center; }
               .stat .value { font-size: 1.5rem; font-weight: 700; font-family: 'SF Mono', monospace; }
-              .stat .label { font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase;
-                letter-spacing: 0.05em; margin-top: 0.25rem; }
+              .stat .label { font-size: 0.7rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 0.25rem; }
               .stat .value.tps { color: var(--success); }
-              .model-item { display: flex; justify-content: space-between; align-items: center;
-                padding: 0.75rem; border-bottom: 1px solid var(--border); }
+              .model-item { display: flex; justify-content: space-between; align-items: center; padding: 0.75rem; border-bottom: 1px solid var(--border); }
               .model-item:last-child { border-bottom: none; }
-              .model-info { flex: 1; min-width: 0; }
               .model-name { font-weight: 600; font-size: 0.9rem; word-break: break-all; }
               .model-meta { font-size: 0.75rem; color: var(--text-muted); margin-top: 0.25rem; }
-              .model-actions { flex-shrink: 0; margin-left: 1rem; }
-              .nav-link { color: var(--text-muted); text-decoration: none; font-size: 0.875rem;
-                padding: 0.5rem 1rem; border-radius: 8px; transition: all 0.15s; }
+              .nav-link { color: var(--text-muted); text-decoration: none; font-size: 0.875rem; padding: 0.5rem 1rem; border-radius: 8px; transition: all 0.15s; }
               .nav-link:hover { background: rgba(148, 163, 184, 0.1); color: var(--text); }
               .nav-link.active { background: rgba(59, 130, 246, 0.1); color: var(--primary); }
-              
-              /* Loading Overlay */
-              #loadingOverlay {
-                position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
-                background: rgba(10, 14, 26, 0.85); backdrop-filter: blur(4px);
-                display: none; justify-content: center; align-items: center; z-index: 9999;
-                flex-direction: column; gap: 1rem; text-align: center; padding: 1rem;
-              }
-              .spinner {
-                width: 50px; height: 50px; border: 4px solid rgba(59, 130, 246, 0.2);
-                border-left-color: var(--primary); border-radius: 50%;
-                animation: spin 1s linear infinite;
-              }
+              .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1rem; }
+              #loadingOverlay { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(10, 14, 26, 0.85); backdrop-filter: blur(4px); display: none; justify-content: center; align-items: center; z-index: 9999; flex-direction: column; gap: 1rem; text-align: center; padding: 1rem; }
+              .spinner { width: 50px; height: 50px; border: 4px solid rgba(59, 130, 246, 0.2); border-left-color: var(--primary); border-radius: 50%; animation: spin 1s linear infinite; }
               @keyframes spin { to { transform: rotate(360deg); } }
               #loadingText { font-size: 1.1rem; font-weight: 500; color: var(--text); }
             </style>
           </head>
           <body>
-            <!-- Loading Overlay -->
-            <div id="loadingOverlay">
-              <div class="spinner"></div>
-              <div id="loadingText">Processing...</div>
-            </div>
-
+            <div id="loadingOverlay"><div class="spinner"></div><div id="loadingText">Processing...</div></div>
             {% block body %}{% endblock %}
-
             <script>
-              function showLoading(text) {
-                document.getElementById('loadingText').innerHTML = text;
-                document.getElementById('loadingOverlay').style.display = 'flex';
-              }
-              function hideLoading() {
-                document.getElementById('loadingOverlay').style.display = 'none';
-              }
-              function copyText(id, btn) {
-                const input = document.getElementById(id);
-                navigator.clipboard.writeText(input.value).then(() => {
-                  const orig = btn.textContent;
-                  btn.textContent = 'Copied!';
-                  setTimeout(() => btn.textContent = orig, 1500);
-                });
-              }
-              function togglePassword(id, btn) {
-                const input = document.getElementById(id);
-                if (input.type === "password") {
-                  input.type = "text";
-                  btn.textContent = "Hide";
-                } else {
-                  input.type = "password";
-                  btn.textContent = "Show";
-                }
-              }
+              function showLoading(text) { document.getElementById('loadingText').innerHTML = text; document.getElementById('loadingOverlay').style.display = 'flex'; }
+              function hideLoading() { document.getElementById('loadingOverlay').style.display = 'none'; }
+              function copyText(id, btn) { const input = document.getElementById(id); navigator.clipboard.writeText(input.value).then(() => { const orig = btn.textContent; btn.textContent = 'Copied!'; setTimeout(() => btn.textContent = orig, 1500); }); }
+              function togglePassword(id, btn) { const input = document.getElementById(id); if (input.type === "password") { input.type = "text"; btn.textContent = "Hide"; } else { input.type = "password"; btn.textContent = "Show"; } }
             </script>
           </body>
           </html>
@@ -733,6 +622,12 @@ jobs:
                 {% endif %}
               </div>
               <p class="mono-large">{{ current }}</p>
+              
+              {% if current != "None" %}
+              <div style="display: flex; gap: 1rem;">
+                <button onclick="unloadModel()" class="danger" style="flex: 1;">Unload Model (Free RAM)</button>
+              </div>
+              {% endif %}
             </div>
 
             {% if last_stats %}
@@ -757,26 +652,45 @@ jobs:
 
             {% if models %}
             <div class="card">
-              <h2>Load Existing Model</h2>
+              <h2>Load Model</h2>
+              <div class="settings-grid">
+                <div>
+                  <label>Context Window (n_ctx)</label>
+                  <select id="nCtx">
+                    <option value="1024">1024 (Low RAM)</option>
+                    <option value="2048">2048</option>
+                    <option value="4096" selected>4096 (Default)</option>
+                    <option value="8192">8192 (High RAM)</option>
+                  </select>
+                </div>
+                <div>
+                  <label>CPU Threads</label>
+                  <input type="number" id="nThreads" value="{{ cpu_count - 1 }}" min="1" max="{{ cpu_count }}">
+                </div>
+              </div>
+              
               <form id="loadModelForm" class="row">
                 <select name="model_name" id="modelSelect">
                   {% for m in models %}
                   <option value="{{ m }}" {% if m == current %}selected{% endif %}>{{ m }}</option>
                   {% endfor %}
                 </select>
-                <button type="submit">Load</button>
+                <button type="submit">Load Model</button>
               </form>
             </div>
             <script>
               document.getElementById('loadModelForm').addEventListener('submit', async (e) => {
                 e.preventDefault();
                 const modelName = document.getElementById('modelSelect').value;
+                const nCtx = document.getElementById('nCtx').value;
+                const nThreads = document.getElementById('nThreads').value;
+                
                 showLoading(`Loading ${modelName} into memory...`);
                 try {
                   const res = await fetch('/api/load-model', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ model_name: modelName })
+                    body: JSON.stringify({ model_name: modelName, n_ctx: nCtx, n_threads: nThreads })
                   });
                   const data = await res.json();
                   if (!res.ok) throw new Error(data.error || 'Failed to load');
@@ -786,40 +700,21 @@ jobs:
                   hideLoading();
                 }
               });
-            </script>
-            {% endif %}
 
-            <div class="card">
-              <h2>Download from Hugging Face (Manual)</h2>
-              <form id="manualDownloadForm">
-                <label>Repository ID</label>
-                <input type="text" id="repoId" placeholder="TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF" required>
-                <label>Filename</label>
-                <input type="text" id="fileName" placeholder="tinyllama-1.1b-chat-v1.0.Q8_0.gguf" required>
-                <button type="submit">Download</button>
-              </form>
-            </div>
-            <script>
-              document.getElementById('manualDownloadForm').addEventListener('submit', async (e) => {
-                e.preventDefault();
-                const repoId = document.getElementById('repoId').value;
-                const fileName = document.getElementById('fileName').value;
-                showLoading(`Downloading ${fileName}...<br><small>This may take a few minutes depending on size.</small>`);
+              async function unloadModel() {
+                if (!confirm('Are you sure you want to unload the model? This will free all RAM.')) return;
+                showLoading('Unloading model...');
                 try {
-                  const res = await fetch('/api/download-model', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ repo_id: repoId, filename: fileName })
-                  });
-                  const data = await res.json();
-                  if (!res.ok) throw new Error(data.error || 'Failed to download');
+                  const res = await fetch('/api/unload-model', { method: 'POST' });
+                  if (!res.ok) throw new Error('Failed to unload');
                   window.location.reload();
                 } catch (err) {
                   alert(err.message);
                   hideLoading();
                 }
-              });
+              }
             </script>
+            {% endif %}
 
             <div class="card">
               <h2>API Access</h2>
