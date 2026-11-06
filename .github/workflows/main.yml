@@ -1,0 +1,326 @@
+name: Custom‑Auth LLM Proxy with On‑Demand Model Download
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy-custom-proxy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Add Swap Space for Large Models
+        run: |
+          sudo fallocate -l 20G /mnt/large-swapfile
+          sudo chmod 600 /mnt/large-swapfile
+          sudo mkswap /mnt/large-swapfile
+          sudo swapon /mnt/large-swapfile
+          free -h
+
+      - name: Clone Text‑Generation‑WebUI
+        run: |
+          git clone https://github.com/oobabooga/text-generation-webui.git
+          cd text-generation-webui
+
+      - name: Install WebUI Dependencies (CPU)
+        run: |
+          cd text-generation-webui
+          pip install -r requirements.txt
+
+      - name: Install Proxy Dependencies
+        run: |
+          pip install fastapi uvicorn httpx jinja2 python-multipart itsdangerous passlib[bcrypt] huggingface-hub
+
+      - name: Write Custom Proxy Application
+        run: |
+          mkdir -p proxy/templates proxy/data
+          cat > proxy/main.py << 'PYEOF'
+          import os
+          import json
+          import subprocess
+          import httpx
+          from pathlib import Path
+          from fastapi import FastAPI, Request, Form, Depends, HTTPException
+          from fastapi.responses import HTMLResponse, RedirectResponse
+          from fastapi.templating import Jinja2Templates
+          from starlette.middleware.sessions import SessionMiddleware
+          from starlette.status import HTTP_303_SEE_OTHER
+          from passlib.context import CryptContext
+          from huggingface_hub import snapshot_download
+
+          # --- Configuration ---
+          WEBUI_BASE = "http://localhost:5000"
+          API_KEY = "internal-key-123"
+          ADMIN_KEY = "admin-key-456"
+          SECRET_KEY = "change-this-session-secret"
+          CONFIG_FILE = Path("proxy/data/config.json")
+          DOWNLOAD_SCRIPT = Path("../text-generation-webui/download-model.py")
+
+          app = FastAPI()
+          app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
+          templates = Jinja2Templates(directory="proxy/templates")
+          pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+          # --- Helpers ---
+          def load_config():
+              if CONFIG_FILE.exists():
+                  return json.loads(CONFIG_FILE.read_text())
+              return {}
+
+          def save_config(cfg):
+              CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+              CONFIG_FILE.write_text(json.dumps(cfg))
+
+          def is_password_set():
+              return "password_hash" in load_config()
+
+          def verify_password(password: str) -> bool:
+              cfg = load_config()
+              return pwd_context.verify(password, cfg.get("password_hash", ""))
+
+          def get_user(request: Request):
+              user = request.session.get("user")
+              if not user:
+                  raise HTTPException(status_code=303, headers={"Location": "/login"})
+              return user
+
+          async def list_models():
+              async with httpx.AsyncClient() as client:
+                  r = await client.get(
+                      f"{WEBUI_BASE}/v1/internal/model/list",
+                      headers={"Authorization": f"Bearer {ADMIN_KEY}"}
+                  )
+                  if r.status_code == 200:
+                      return r.json().get("model_list", [])
+              return []
+
+          async def current_model():
+              async with httpx.AsyncClient() as client:
+                  r = await client.get(
+                      f"{WEBUI_BASE}/v1/internal/model/current",
+                      headers={"Authorization": f"Bearer {ADMIN_KEY}"}
+                  )
+                  if r.status_code == 200:
+                      return r.json().get("model_name", "None")
+              return "Unknown"
+
+          def download_model(model_id: str):
+              """Run download-model.py from the WebUI directory."""
+              cmd = ["python", str(DOWNLOAD_SCRIPT), model_id]
+              result = subprocess.run(cmd, capture_output=True, text=True, cwd=DOWNLOAD_SCRIPT.parent)
+              if result.returncode != 0:
+                  raise RuntimeError(f"Download failed: {result.stderr}")
+              return result.stdout
+
+          async def load_model(model_name: str):
+              async with httpx.AsyncClient() as client:
+                  r = await client.post(
+                      f"{WEBUI_BASE}/v1/internal/model/load",
+                      json={"model_name": model_name},
+                      headers={"Authorization": f"Bearer {ADMIN_KEY}"},
+                      timeout=300.0   # loading a large model may take time
+                  )
+                  if r.status_code != 200:
+                      raise RuntimeError(f"Load failed: {r.text}")
+                  return r.json()
+
+          # --- Setup (first‑time router style) ---
+          @app.get("/setup", response_class=HTMLResponse)
+          async def setup_page(request: Request):
+              if is_password_set():
+                  return RedirectResponse(url="/login")
+              return templates.TemplateResponse("setup.html", {"request": request})
+
+          @app.post("/setup")
+          async def setup(request: Request, password: str = Form(...), confirm: str = Form(...)):
+              if is_password_set():
+                  return RedirectResponse(url="/login")
+              if password != confirm:
+                  return templates.TemplateResponse("setup.html", {"request": request, "error": "Passwords do not match"})
+              if len(password) < 4:
+                  return templates.TemplateResponse("setup.html", {"request": request, "error": "Password too short (min 4 chars)"})
+              save_config({"password_hash": pwd_context.hash(password)})
+              return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
+
+          # --- Login ---
+          @app.get("/login", response_class=HTMLResponse)
+          async def login_page(request: Request):
+              if not is_password_set():
+                  return RedirectResponse(url="/setup")
+              return templates.TemplateResponse("login.html", {"request": request})
+
+          @app.post("/login")
+          async def login(request: Request, password: str = Form(...)):
+              if not is_password_set():
+                  return RedirectResponse(url="/setup")
+              if verify_password(password):
+                  request.session["user"] = "admin"
+                  return RedirectResponse(url="/", status_code=HTTP_303_SEE_OTHER)
+              return templates.TemplateResponse("login.html", {"request": request, "error": "Wrong password"})
+
+          @app.get("/logout")
+          async def logout(request: Request):
+              request.session.clear()
+              return RedirectResponse(url="/login")
+
+          # --- Dashboard (model selection + download) ---
+          @app.get("/", response_class=HTMLResponse)
+          async def dashboard(request: Request, user: str = Depends(get_user)):
+              models = await list_models()
+              current = await current_model()
+              return templates.TemplateResponse(
+                  "dashboard.html",
+                  {"request": request, "user": user, "models": models, "current": current}
+              )
+
+          @app.post("/load-model")
+          async def handle_load_model(request: Request, model_name: str = Form(...), user: str = Depends(get_user)):
+              models = await list_models()
+              if model_name not in models:
+                  # Model not found locally → download it first
+                  try:
+                      download_model(model_name)   # e.g. "TheBloke/Llama-2-7B-GGUF"
+                  except Exception as e:
+                      return templates.TemplateResponse(
+                          "dashboard.html",
+                          {"request": request, "user": user, "models": models,
+                           "current": await current_model(), "error": f"Download failed: {e}"}
+                      )
+                  # Refresh model list after download
+                  models = await list_models()
+              # Load the model (this automatically unloads the previous one)
+              try:
+                  await load_model(model_name)
+              except Exception as e:
+                  return templates.TemplateResponse(
+                      "dashboard.html",
+                      {"request": request, "user": user, "models": models,
+                       "current": await current_model(), "error": f"Load failed: {e}"}
+                  )
+              return RedirectResponse(url="/", status_code=HTTP_303_SEE_OTHER)
+
+          # --- OpenAI‑compatible proxy ---
+          @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
+          async def proxy_openai(path: str, request: Request, user: str = Depends(get_user)):
+              body = await request.body()
+              headers = dict(request.headers)
+              headers["Authorization"] = f"Bearer {API_KEY}"
+              async with httpx.AsyncClient() as client:
+                  r = await client.request(
+                      method=request.method,
+                      url=f"{WEBUI_BASE}/v1/{path}",
+                      headers=headers,
+                      content=body
+                  )
+              from starlette.responses import Response
+              return Response(content=r.content, status_code=r.status_code, headers=dict(r.headers))
+          PYEOF
+
+          # --- Setup template ---
+          cat > proxy/templates/setup.html << 'HTMLEOF'
+          <!DOCTYPE html>
+          <html>
+          <head><title>First‑time Setup</title></head>
+          <body>
+            <h2>Welcome! Set up your admin password</h2>
+            {% if error %}<p style="color:red">{{ error }}</p>{% endif %}
+            <form method="post" action="/setup">
+              <label>Password: <input name="password" type="password" required></label><br>
+              <label>Confirm: <input name="confirm" type="password" required></label><br>
+              <button type="submit">Save password</button>
+            </form>
+          </body>
+          </html>
+          HTMLEOF
+
+          # --- Login template ---
+          cat > proxy/templates/login.html << 'HTMLEOF'
+          <!DOCTYPE html>
+          <html>
+          <head><title>Login</title></head>
+          <body>
+            <h2>Sign in</h2>
+            {% if error %}<p style="color:red">{{ error }}</p>{% endif %}
+            <form method="post" action="/login">
+              <label>Password: <input name="password" type="password" required></label><br>
+              <button type="submit">Login</button>
+            </form>
+          </body>
+          </html>
+          HTMLEOF
+
+          # --- Dashboard template (with download capability) ---
+          cat > proxy/templates/dashboard.html << 'HTMLEOF'
+          <!DOCTYPE html>
+          <html>
+          <head><title>LLM Dashboard</title></head>
+          <body>
+            <h2>Welcome, {{ user }}! <a href="/logout">Logout</a></h2>
+            <p><strong>Current model:</strong> {{ current }}</p>
+
+            {% if error %}<p style="color:red">{{ error }}</p>{% endif %}
+
+            <h3>Load an existing model</h3>
+            <form method="post" action="/load-model">
+              <select name="model_name">
+                {% for m in models %}
+                <option value="{{ m }}" {% if m == current %}selected{% endif %}>{{ m }}</option>
+                {% endfor %}
+              </select>
+              <button type="submit">Load</button>
+            </form>
+
+            <hr>
+
+            <h3>Download & load a new model</h3>
+            <form method="post" action="/load-model">
+              <input name="model_name" placeholder="e.g. TheBloke/Llama-2-7B-GGUF" size="50" required>
+              <button type="submit">Download & Load</button>
+            </form>
+            <p><small>If the model is not present locally, it will be downloaded from Hugging Face and then loaded. The previously loaded model will be unloaded automatically.</small></p>
+
+            <hr>
+            <p>OpenAI‑SDK endpoint: <code>https://&lt;your‑tunnel&gt;/v1</code></p>
+            <p>API key: <code>any‑string</code> (session auth is used)</p>
+          </body>
+          </html>
+          HTMLEOF
+
+      - name: Start Text‑Generation‑WebUI (OpenAI extension)
+        run: |
+          cd text-generation-webui
+          nohup python server.py \
+            --listen \
+            --cpu \
+            --loader llamacpp \
+            --api \
+            --api-port 5000 \
+            --api-key "internal-key-123" \
+            --admin-key "admin-key-456" \
+            --extensions openai \
+            > webui.log 2>&1 &
+          echo $! > webui.pid
+          sleep 30
+
+      - name: Start Custom Proxy
+        run: |
+          cd proxy
+          nohup uvicorn main:app --host 0.0.0.0 --port 8000 > proxy.log 2>&1 &
+          echo $! > proxy.pid
+          sleep 5
+
+      - name: Install cloudflared
+        run: |
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared-linux-amd64.deb
+
+      - name: Expose via Cloudflare Tunnel
+        run: |
+          cloudflared tunnel --url http://localhost:8000 --no-autoupdate
