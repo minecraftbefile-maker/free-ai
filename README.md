@@ -6,6 +6,11 @@ No GPU. No servers. No monthly bill. Just a GitHub repo and a browser.
 
 ---
 
+> ⚠️ **WARNING: EPHEMERAL STORAGE** 
+> All downloaded models, configuration files, API keys, and chat history will be **permanently wiped** when the GitHub Actions runner shuts down (max 6 hours per run). This environment is strictly for temporary usage, testing, and experimentation. Do not rely on it for production or persistent data.
+
+---
+
 ## ✨ Features
 
 | | |
@@ -27,12 +32,40 @@ No GPU. No servers. No monthly bill. Just a GitHub repo and a browser.
 
 ## 🏗 How It Works
 
-```mermaid
-graph TD
-    Client[OpenAI SDK / Browser UI] -->|HTTPS| CF[Cloudflare Quick Tunnel]
-    CF -->|Proxy| API[FastAPI App]
-    
-    API -->|Manage| Dashboard[WebUI Dashboard]
-    API -->|Inference| LLM[llama-cpp-python]
-    
-    LLM -->|Reads GGUF| HF[(Hugging Face Hub)]
+The system consists of four main components working together:
+
+| Component | Role |
+| :--- | :--- |
+| **Web Browser / OpenAI SDK** | The client interface (either the custom dashboard or your Python/Node code). |
+| **Cloudflare Quick Tunnel** | Provides a free, temporary public HTTPS URL that routes traffic to the runner. |
+| **FastAPI Proxy** | Handles authentication, OpenAI API routing, token/sec calculations, and serves the UI. |
+| **llama-cpp-python** | The CPU inference engine that loads `.gguf` files into RAM and generates text. |
+
+### The Lifecycle of a Request
+
+1. **Startup:** The GitHub workflow installs dependencies, starts the FastAPI proxy, and opens the Cloudflare tunnel. 
+2. **First Visit:** You visit the public URL. The proxy detects no password is set and forces you to create one (`/setup`).
+3. **Model Management:** You use the WebUI to search Hugging Face, download a single-file `.gguf` model, and load it into RAM. 
+4. **API Generation:** You use the generated API key to send requests to `/v1/chat/completions` (or use the dashboard interface). The proxy forwards it to `llama-cpp-python`, formats the response, calculates the tokens/sec, and returns it to you.
+5. **Shutdown:** The job hits the 6-hour limit (or is cancelled), the runner destroys the VM, and all models/data are lost.
+
+---
+
+## 🚀 Quick Start
+
+### 1. Fork this repository
+
+Click **Fork** in the top-right corner.
+
+### 2. Enable Actions
+
+Go to the **Actions** tab → click **"I understand my workflows, go ahead and enable them"** if prompted.
+
+### 3. Run the workflow
+
+- **Actions** → **Custom-Auth LLM Proxy** → **Run workflow** → **Run workflow**
+- Wait ~2–3 minutes for setup to complete.
+
+### 4. Get your URL
+
+In the **"Expose via Cloudflare Tunnel"** step's log, find:
