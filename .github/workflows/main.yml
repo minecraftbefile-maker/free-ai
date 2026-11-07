@@ -199,7 +199,6 @@ jobs:
                           self.last_stats = result["timings"]
                       return result
 
-              # --- CRITICAL FIX: Threaded Queue for Streaming ---
               def stream_worker(self, model_name: str, messages, q: queue.Queue, **kwargs):
                   try:
                       with inference_lock:
@@ -212,18 +211,16 @@ jobs:
                   except Exception as e:
                       q.put({"error": str(e)})
                   finally:
-                      q.put(None) # Sentinel to close stream
+                      q.put(None)
 
               async def stream_async(self, model_name: str, messages, key_id: str, **kwargs) -> AsyncGenerator[str, None]:
                   q = queue.Queue()
                   threading.Thread(target=self.stream_worker, args=(model_name, messages, q), kwargs=kwargs, daemon=True).start()
                   
                   completion_tokens = 0
-                  # Keep-alive comment to prevent Cloudflare timeout
                   yield ": keep-alive\n\n" 
 
                   while True:
-                      # Wait for next chunk without blocking the main event loop
                       try:
                           chunk = await asyncio.wait_for(asyncio.to_thread(q.get), timeout=15.0)
                       except asyncio.TimeoutError:
@@ -461,6 +458,7 @@ jobs:
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>{% block title %}AI Suite{% endblock %}</title>
+            <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
             <style>
               :root { --bg: #0a0e1a; --surface: #1e293b; --border: rgba(148, 163, 184, 0.15); --text: #e2e8f0; --primary: #3b82f6; --success: #10b981; --error: #ef4444; }
               * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -471,7 +469,7 @@ jobs:
               .card { background: rgba(30, 41, 59, 0.8); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; margin-bottom: 1.25rem; }
               .card h2 { font-size: 1rem; margin-bottom: 1rem; display: flex; justify-content: space-between; }
               label { display: block; font-size: 0.75rem; margin-bottom: 0.5rem; color: #94a3b8; text-transform: uppercase; }
-              input, select { width: 100%; padding: 0.7rem 1rem; background: rgba(15, 23, 42, 0.8); border: 1px solid var(--border); border-radius: 8px; color: white; margin-bottom: 1rem; }
+              input, select, textarea { width: 100%; padding: 0.7rem 1rem; background: rgba(15, 23, 42, 0.8); border: 1px solid var(--border); border-radius: 8px; color: white; margin-bottom: 1rem; font-family: inherit; }
               button { padding: 0.7rem 1.5rem; background: var(--primary); color: white; border: none; border-radius: 8px; cursor: pointer; }
               button:hover { opacity: 0.9; }
               .btn-secondary { background: #334155; } .btn-danger { background: var(--error); }
@@ -488,6 +486,10 @@ jobs:
               .spinner { width: 50px; height: 50px; border: 4px solid rgba(59, 130, 246, 0.2); border-left-color: var(--primary); border-radius: 50%; animation: spin 1s linear infinite; }
               @keyframes spin { to { transform: rotate(360deg); } }
               #loadingText { font-size: 1.1rem; font-weight: 500; color: white; }
+              .markdown-body p { margin-bottom: 0.75rem; }
+              .markdown-body ul, .markdown-body ol { margin-left: 1.5rem; margin-bottom: 0.75rem; }
+              .markdown-body code { background: rgba(0,0,0,0.3); padding: 0.2rem 0.4rem; border-radius: 4px; font-family: monospace; font-size: 0.85em; }
+              .markdown-body pre { background: rgba(0,0,0,0.4); padding: 1rem; border-radius: 8px; overflow-x: auto; margin-bottom: 0.75rem; }
             </style>
           </head>
           <body>
@@ -642,7 +644,8 @@ jobs:
               </div>
             </div>
 
-            <div class="card" style="flex: 1; display: flex; flex-direction: column; height: 70vh;">
+            <div class="card" style="flex: 1; display: flex; flex-direction: column; height: 80vh;">
+              
               <div class="row" style="margin-bottom: 1rem;">
                 <select id="modelSelect" style="flex: 1; margin: 0;">
                   {% for m in loaded_models %}
@@ -651,6 +654,14 @@ jobs:
                   <option value="">No models loaded</option>
                   {% endfor %}
                 </select>
+              </div>
+
+              <!-- System Prompt Editor -->
+              <div style="margin-bottom: 1rem;">
+                <details>
+                  <summary style="cursor: pointer; color: #94a3b8; font-size: 0.85rem; margin-bottom: 0.5rem;">⚙️ System Prompt</summary>
+                  <textarea id="systemPrompt" rows="3" placeholder="You are a helpful assistant. Answer directly without showing your thinking process.">You are a helpful assistant. Answer directly without showing your thinking process.</textarea>
+                </details>
               </div>
               
               <div id="chatBox" style="flex: 1; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; padding: 1rem; margin-bottom: 1rem; background: rgba(15, 23, 42, 0.6);">
@@ -669,6 +680,7 @@ jobs:
             const chatForm = document.getElementById('chatForm');
             const chatInput = document.getElementById('chatInput');
             const modelSelect = document.getElementById('modelSelect');
+            const systemPromptInput = document.getElementById('systemPrompt');
             let history = [];
 
             function appendMessage(role, text) {
@@ -691,6 +703,9 @@ jobs:
               history.push({ role: 'user', content: text });
 
               const aiDiv = appendMessage('assistant', '...');
+              
+              let sysPrompt = systemPromptInput.value.trim();
+              let messagesToSend = sysPrompt ? [{ role: 'system', content: sysPrompt }, ...history] : history;
 
               try {
                 const res = await fetch('/v1/chat/completions', {
@@ -698,7 +713,7 @@ jobs:
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
                     model: modelSelect.value,
-                    messages: history,
+                    messages: messagesToSend,
                     stream: true
                   })
                 });
@@ -719,7 +734,24 @@ jobs:
                         const data = JSON.parse(line.slice(6));
                         if (data.choices && data.choices[0].delta.content) {
                           aiText += data.choices[0].delta.content;
-                          aiDiv.innerHTML = `<strong>AI:</strong> ${aiText}`;
+                          
+                          // --- Thinking Parser & Markdown ---
+                          let thinkingHtml = "";
+                          let cleanText = aiText;
+                          
+                          // Extract completed <think> blocks
+                          cleanText = cleanText.replace(/<think>([\s\S]*?)<\/think>/g, (match, p1) => {
+                              thinkingHtml += `<details style="margin-bottom: 0.5rem; background: rgba(0,0,0,0.2); border-radius: 4px; padding: 0.5rem;"><summary style="cursor: pointer; color: #94a3b8; font-size: 0.85rem;">🧠 Thinking Process</summary><div style="margin-top: 0.5rem; font-size: 0.85rem; color: #cbd5e1; font-family: monospace; white-space: pre-wrap;">${p1.trim()}</div></details>`;
+                              return "";
+                          });
+                          
+                          // Extract currently open <think> blocks
+                          cleanText = cleanText.replace(/<think>([\s\S]*)$/, (match, p1) => {
+                              thinkingHtml += `<details open style="margin-bottom: 0.5rem; background: rgba(0,0,0,0.2); border-radius: 4px; padding: 0.5rem;"><summary style="cursor: pointer; color: #94a3b8; font-size: 0.85rem;">🧠 Thinking Process...</summary><div style="margin-top: 0.5rem; font-size: 0.85rem; color: #cbd5e1; font-family: monospace; white-space: pre-wrap;">${p1.trim()}</div></details>`;
+                              return "";
+                          });
+
+                          aiDiv.innerHTML = `<strong>AI:</strong><br>${thinkingHtml}<div class="markdown-body" style="margin-top: 0.5rem;">${marked.parse(cleanText)}</div>`;
                           chatBox.scrollTop = chatBox.scrollHeight;
                         }
                       } catch (err) {}
