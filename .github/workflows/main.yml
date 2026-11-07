@@ -1,4 +1,4 @@
-name: Ultimate AI Suite (Text < 9B, Image Store, Keys)
+name: Ultimate AI Suite (Text < 9B, Image Models, Keys)
 
 on:
   workflow_dispatch:
@@ -21,25 +21,23 @@ jobs:
           echo "Fetching the latest release from GitHub API..."
           LATEST_RELEASE=$(curl -s https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/latest)
           
-          # Find the asset matching the Linux CPU x86_64 pattern
-          ASSET_URL=$(echo "$LATEST_RELEASE" | jq -r '.assets[] | select(.name | test("bin-Linux.*x86_64.*\\.zip$")) | .browser_download_url' | head -n 1)
+          # Find the asset matching Linux x86_64, explicitly excluding rocm/cuda/vulkan
+          ASSET_URL=$(echo "$LATEST_RELEASE" | jq -r '.assets[] | select(.name | test("bin-Linux.*x86_64.*\\.zip$")) | select(.name | test("rocm|cuda|vulkan") | not) | .browser_download_url' | head -n 1)
           
           if [ -z "$ASSET_URL" ]; then
-            echo "❌ Could not find a Linux x86_64 asset in the latest release."
-            echo "$LATEST_RELEASE" | jq -r '.assets[].name' # Print available assets for debugging
+            echo "❌ Could not find a Linux x86_64 CPU asset."
+            echo "$LATEST_RELEASE" | jq -r '.assets[].name'
             exit 1
           fi
           
           echo "Downloading: $ASSET_URL"
           curl -L -o sd.cpp.zip "$ASSET_URL"
           
-          echo "Extracting..."
           unzip -q sd.cpp.zip -d sd_bin
           
-          # Locate the sd-cli binary
           SD_CLI=$(find sd_bin -name "sd-cli" -type f | head -n 1)
           if [ -z "$SD_CLI" ]; then
-            echo "❌ sd-cli binary not found in the archive."
+            echo "❌ sd-cli not found."
             ls -R sd_bin
             exit 1
           fi
@@ -47,7 +45,6 @@ jobs:
           chmod +x "$SD_CLI"
           echo "✅ Found sd-cli at: $SD_CLI"
           
-          # Create a stable symlink for the backend to use
           mkdir -p stable-diffusion.cpp/build/bin
           ln -sf "$(pwd)/$SD_CLI" stable-diffusion.cpp/build/bin/sd-cli
 
@@ -128,7 +125,7 @@ jobs:
           inference_lock = threading.Lock()
           image_lock = threading.Lock()
 
-          # ---------- Curated Image Models (Small, SD.cpp compatible) ----------
+          # ---------- Expanded Small Image Models ----------
           POPULAR_IMAGE_MODELS = [
               {
                   "id": "stabilityai/sd-turbo",
@@ -138,6 +135,24 @@ jobs:
                   "type": "image",
                   "size": "small",
                   "steps": 1
+              },
+              {
+                  "id": "runwayml/stable-diffusion-v1-5",
+                  "name": "SD 1.5 (Classic, Small)",
+                  "filename": "v1-5-pruned-emaonly.safetensors",
+                  "repo_id": "runwayml/stable-diffusion-v1-5",
+                  "type": "image",
+                  "size": "small",
+                  "steps": 25
+              },
+              {
+                  "id": "stabilityai/stable-diffusion-2-1",
+                  "name": "SD 2.1 (Improved, Small)",
+                  "filename": "v2-1_768-ema-pruned.safetensors",
+                  "repo_id": "stabilityai/stable-diffusion-2-1",
+                  "type": "image",
+                  "size": "small",
+                  "steps": 25
               },
               {
                   "id": "OlegSkutte/sdxl-turbo-GGUF",
