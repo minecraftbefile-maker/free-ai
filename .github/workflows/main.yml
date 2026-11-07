@@ -1,4 +1,4 @@
-name: AI Text Suite (Text < 9B, Keys, Store)
+name: Ultimate AI Suite (Multi-Model, Playground, Keys)
 
 on:
   workflow_dispatch:
@@ -30,7 +30,7 @@ jobs:
           pip install llama-cpp-python[server] \
             --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu \
             --prefer-binary
-          pip install huggingface-hub fastapi uvicorn jinja2 python-multipart itsdangerous
+          pip install huggingface-hub fastapi uvicorn jinja2 python-multipart itsdangerous psutil
 
       - name: Install cloudflared
         run: |
@@ -52,6 +52,8 @@ jobs:
           import threading
           import asyncio
           import datetime
+          import psutil
+          import queue
           from pathlib import Path
           from typing import Optional, AsyncGenerator, List, Dict, Any
 
@@ -118,20 +120,28 @@ jobs:
                           break
                   save_keys(keys)
 
-          # ---------- Model Manager (Text) ----------
+          # ---------- Multi-Model Manager ----------
           class ModelManager:
               def __init__(self):
-                  self.current_llm: Optional[Llama] = None
-                  self.current_model_name: Optional[str] = None
+                  self.models: Dict[str, Llama] = {}
                   self.last_stats: dict = {}
 
               def load_model(self, model_path: str, model_name: str):
+                  if model_name in self.models:
+                      return 
+
+                  file_size = os.path.getsize(model_path)
+                  free_ram = psutil.virtual_memory().available
+                  free_swap = psutil.swap_memory().free
+                  total_free = free_ram + free_swap
+                  
+                  if file_size + (1024 * 1024 * 1024) > total_free:
+                      raise HTTPException(
+                          status_code=413,
+                          detail=f"OOM Risk: Model needs {file_size/1e9:.1f}GB, but only {total_free/1e9:.1f}GB available."
+                      )
+
                   with inference_lock:
-                      if self.current_llm is not None:
-                          try: self.current_llm.close()
-                          except: pass
-                          self.current_llm = None
-                      
                       is_vision = any(tag in model_name.lower() for tag in ["vision", "vl", "llava"])
                       chat_handler = None
                       if is_vision and MTMDChatHandler is not None:
@@ -141,28 +151,43 @@ jobs:
                       safe_threads = max(1, (os.cpu_count() or 4) - 1)
                       
                       try:
-                          self.current_llm = Llama(
+                          llm = Llama(
                               model_path=model_path, n_ctx=4096, n_threads=safe_threads,
                               n_gpu_layers=0, use_mlock=True, verbose=False,
                               chat_handler=chat_handler
                           )
                       except Exception:
-                          self.current_llm = Llama(
+                          llm = Llama(
                               model_path=model_path, n_ctx=4096, n_threads=safe_threads,
                               n_gpu_layers=0, use_mlock=True, verbose=False
                           )
-                      self.current_model_name = model_name
+                      self.models[model_name] = llm
 
-              def generate_sync(self, messages, **kwargs):
+              def unload_model(self, model_name: str):
                   with inference_lock:
+                      if model_name in self.models:
+                          try: self.models[model_name].close()
+                          except: pass
+                          del self.models[model_name]
+
+              def get_model(self, model_name: str) -> Llama:
+                  if model_name not in self.models:
+                      if not self.models:
+                          raise RuntimeError("No models loaded. Please load a model first.")
+                      model_name = list(self.models.keys())[0]
+                  return self.models[model_name]
+
+              def generate_sync(self, model_name: str, messages, **kwargs):
+                  with inference_lock:
+                      llm = self.get_model(model_name)
                       t0 = time.time()
-                      result = self.current_llm.create_chat_completion(
+                      result = llm.create_chat_completion(
                           messages=messages, max_tokens=kwargs.get("max_tokens", 4096),
                           **{k: v for k, v in kwargs.items() if k != "max_tokens"}
                       )
                       elapsed = time.time() - t0
                       if isinstance(result, dict):
-                          result["model"] = self.current_model_name
+                          result["model"] = model_name
                           usage = result.get("usage", {})
                           completion_tokens = usage.get("completion_tokens", 0)
                           tps = completion_tokens / elapsed if elapsed > 0 else 0
@@ -174,45 +199,59 @@ jobs:
                           self.last_stats = result["timings"]
                       return result
 
-              def stream_sync(self, messages, **kwargs) -> AsyncGenerator[dict, None]:
-                  t0 = time.time()
-                  completion_tokens = 0
-                  with inference_lock:
-                      for chunk in self.current_llm.create_chat_completion(
-                          messages=messages, max_tokens=kwargs.get("max_tokens", 4096),
-                          stream=True, **{k: v for k, v in kwargs.items() if k != "max_tokens"}
-                      ):
-                          if isinstance(chunk, dict):
-                              chunk["model"] = self.current_model_name
-                              if chunk.get("choices"):
-                                  delta = chunk["choices"][0].get("delta", {})
-                                  if delta.get("content") or delta.get("tool_calls"):
-                                      completion_tokens += 1
-                          yield chunk
+              # --- CRITICAL FIX: Threaded Queue for Streaming ---
+              def stream_worker(self, model_name: str, messages, q: queue.Queue, **kwargs):
+                  try:
+                      with inference_lock:
+                          llm = self.get_model(model_name)
+                          for chunk in llm.create_chat_completion(
+                              messages=messages, max_tokens=kwargs.get("max_tokens", 4096),
+                              stream=True, **{k: v for k, v in kwargs.items() if k != "max_tokens"}
+                          ):
+                              q.put(chunk)
+                  except Exception as e:
+                      q.put({"error": str(e)})
+                  finally:
+                      q.put(None) # Sentinel to close stream
+
+              async def stream_async(self, model_name: str, messages, key_id: str, **kwargs) -> AsyncGenerator[str, None]:
+                  q = queue.Queue()
+                  threading.Thread(target=self.stream_worker, args=(model_name, messages, q), kwargs=kwargs, daemon=True).start()
                   
-                  elapsed = time.time() - t0
-                  tps = completion_tokens / elapsed if elapsed > 0 else 0
-                  self.last_stats = {"total_time": round(elapsed, 3), "completion_tokens": completion_tokens, "tokens_per_second": round(tps, 2)}
-                  yield {
-                      "id": f"chatcmpl-{uuid.uuid4()}", "object": "chat.completion.chunk",
-                      "created": int(time.time()), "model": self.current_model_name, "choices": [],
-                      "usage": {"completion_tokens": completion_tokens, "total_tokens": completion_tokens},
-                      "timings": self.last_stats,
-                  }
-
-              async def generate_async(self, messages, **kwargs):
-                  if self.current_llm is None: raise RuntimeError("No model loaded")
-                  return await asyncio.to_thread(self.generate_sync, messages, **kwargs)
-
-              async def stream_async(self, messages, key_id: str, **kwargs) -> AsyncGenerator[str, None]:
-                  if self.current_llm is None: raise RuntimeError("No model loaded")
                   completion_tokens = 0
-                  for chunk in self.stream_sync(messages, **kwargs):
-                      if chunk.get("usage"): completion_tokens = chunk["usage"]["completion_tokens"]
+                  # Keep-alive comment to prevent Cloudflare timeout
+                  yield ": keep-alive\n\n" 
+
+                  while True:
+                      # Wait for next chunk without blocking the main event loop
+                      try:
+                          chunk = await asyncio.wait_for(asyncio.to_thread(q.get), timeout=15.0)
+                      except asyncio.TimeoutError:
+                          yield ": keep-alive\n\n"
+                          continue
+
+                      if chunk is None:
+                          break
+
+                      if "error" in chunk:
+                          yield f"data: {json.dumps({'error': chunk['error']})}\n\n"
+                          break
+                          
+                      if isinstance(chunk, dict):
+                          chunk["model"] = model_name
+                          if chunk.get("choices"):
+                              delta = chunk["choices"][0].get("delta", {})
+                              if delta.get("content") or delta.get("tool_calls"):
+                                  completion_tokens += 1
+                      
                       yield f"data: {json.dumps(chunk)}\n\n"
                       await asyncio.sleep(0.01)
+                  
                   yield "data: [DONE]\n\n"
                   await asyncio.to_thread(increment_usage, key_id, completion_tokens)
+
+              async def generate_async(self, model_name: str, messages, **kwargs):
+                  return await asyncio.to_thread(self.generate_sync, model_name, messages, **kwargs)
 
           manager = ModelManager()
 
@@ -286,9 +325,17 @@ jobs:
 
           @app.get("/", response_class=HTMLResponse)
           async def dashboard(request: Request, user: str = Depends(require_user)):
+              loaded_models = list(manager.models.keys())
+              available_models = sorted(f.name for f in MODELS_DIR.glob("*.gguf") if f.name not in loaded_models)
               return templates.TemplateResponse(request, "dashboard.html", {
-                  "user": user, "models": sorted(f.name for f in MODELS_DIR.glob("*.gguf")),
-                  "current": manager.current_model_name or "None", "base_url": str(request.base_url).rstrip("/")
+                  "user": user, "loaded_models": loaded_models, "available_models": available_models,
+                  "base_url": str(request.base_url).rstrip("/")
+              })
+
+          @app.get("/playground", response_class=HTMLResponse)
+          async def playground_page(request: Request, user: str = Depends(require_user)):
+              return templates.TemplateResponse(request, "playground.html", {
+                  "user": user, "loaded_models": list(manager.models.keys())
               })
 
           @app.get("/keys", response_class=HTMLResponse)
@@ -333,42 +380,35 @@ jobs:
           @app.post("/api/load-model")
           async def api_load_model(request: Request, user: dict = Depends(require_api_user)):
               b = await request.json()
-              path = MODELS_DIR / b.get("model_name")
+              model_name = b.get("model_name")
+              path = MODELS_DIR / model_name
               if not path.exists(): return JSONResponse(status_code=404, content={"error": "Model not found"})
-              await asyncio.to_thread(manager.load_model, str(path), b.get("model_name"))
+              try:
+                  await asyncio.to_thread(manager.load_model, str(path), model_name)
+                  return {"status": "ok"}
+              except HTTPException as e:
+                  return JSONResponse(status_code=e.status_code, content={"error": e.detail})
+              except Exception as e:
+                  return JSONResponse(status_code=500, content={"error": str(e)})
+
+          @app.post("/api/unload-model")
+          async def api_unload_model(request: Request, user: dict = Depends(require_api_user)):
+              b = await request.json()
+              await asyncio.to_thread(manager.unload_model, b.get("model_name"))
               return {"status": "ok"}
 
           @app.get("/api/store/search")
           async def api_store_search(q: str = "", vision_only: bool = False):
               try:
-                  # 1. Primary Search: Strict Text-Generation + GGUF + Max 9B
                   models = await asyncio.to_thread(
                       hf_api.list_models,
-                      search=q,
-                      filter="gguf",
-                      pipeline_tag="text-generation",
-                      num_parameters="max:9B",
-                      sort="downloads",
-                      limit=30,
-                      expand=["tags"]
+                      search=q, filter="gguf", pipeline_tag="text-generation",
+                      num_parameters="min:0B,max:9B", sort="downloads", limit=30, expand=["tags"]
                   )
-                  
-                  # 2. Fallback: If no models found (HF metadata missing param count), drop the 9B limit
-                  if not models:
-                      models = await asyncio.to_thread(
-                          hf_api.list_models,
-                          search=q,
-                          filter="gguf",
-                          pipeline_tag="text-generation",
-                          sort="downloads",
-                          limit=30,
-                          expand=["tags"]
-                      )
-                      
                   res = []
                   for m in models:
                       is_v = any(t in (m.tags or []) for t in ["vision", "multimodal"])
-                      if not vision_only or is_v: 
+                      if not vision_only or is_v:
                           res.append({"id": m.id, "downloads": m.downloads, "is_vision": is_v})
                   return res
               except Exception as e:
@@ -389,18 +429,28 @@ jobs:
           @app.post("/v1/chat/completions")
           async def chat_completions(request: Request, user: dict = Depends(require_api_user)):
               body = await request.json()
+              model_name = body.pop("model", "auto")
               messages, stream = body.pop("messages", []), body.pop("stream", False)
               try:
                   if stream:
-                      return StreamingResponse(manager.stream_async(messages, user["id"], **body), media_type="text/event-stream")
-                  res = await manager.generate_async(messages, **body)
+                      return StreamingResponse(
+                          manager.stream_async(model_name, messages, user["id"], **body), 
+                          media_type="text/event-stream",
+                          headers={
+                              "Cache-Control": "no-cache",
+                              "Connection": "keep-alive",
+                              "X-Accel-Buffering": "no"
+                          }
+                      )
+                  res = await manager.generate_async(model_name, messages, **body)
                   await asyncio.to_thread(increment_usage, user["id"], res.get("usage", {}).get("completion_tokens", 0))
                   return JSONResponse(content=res)
-              except Exception as e: return JSONResponse(status_code=500, content={"error": str(e)})
+              except Exception as e: 
+                  return JSONResponse(status_code=500, content={"error": str(e)})
 
           @app.get("/health")
           async def health():
-              return {"status": "ok", "text_model": manager.current_model_name or "none"}
+              return {"status": "ok", "loaded_models": list(manager.models.keys())}
           PYEOF
 
           # ---------- base.html ----------
@@ -502,6 +552,7 @@ jobs:
               <div class="logo">🚀 <span>AI Suite</span></div>
               <div class="row">
                 <a href="/" class="nav-link active">Dashboard</a>
+                <a href="/playground" class="nav-link">Playground</a>
                 <a href="/keys" class="nav-link">API Keys</a>
                 <a href="/store" class="nav-link">Store</a>
                 <span class="muted" style="margin: 0;">{{ user }}</span>
@@ -510,41 +561,33 @@ jobs:
             </div>
 
             <div class="card">
-              <div class="card-header">
-                <h2>Current Text Model</h2>
-                {% if current == "None" %}
-                  <span class="badge" style="background: rgba(148, 163, 184, 0.1);">no model loaded</span>
-                {% else %}
-                  <span class="badge loaded">● loaded</span>
-                {% endif %}
-              </div>
-              <p class="mono-large">{{ current }}</p>
+              <h2>Loaded Models</h2>
+              {% if loaded_models %}
+                {% for m in loaded_models %}
+                <div class="row" style="border-bottom: 1px solid var(--border); padding: 0.75rem 0;">
+                  <div style="flex: 1;">
+                    <div style="font-weight: 600;">{{ m }}</div>
+                  </div>
+                  <button class="btn-danger" onclick="unloadModel('{{ m }}')">Unload</button>
+                </div>
+                {% endfor %}
+              {% else %}
+                <p class="muted">No models currently loaded in RAM.</p>
+              {% endif %}
             </div>
 
-            {% if models %}
+            {% if available_models %}
             <div class="card">
-              <h2>Load Existing Model</h2>
+              <h2>Load New Model</h2>
               <form id="loadModelForm" class="row">
                 <select name="model_name" id="modelSelect">
-                  {% for m in models %}
-                  <option value="{{ m }}" {% if m == current %}selected{% endif %}>{{ m }}</option>
+                  {% for m in available_models %}
+                  <option value="{{ m }}">{{ m }}</option>
                   {% endfor %}
                 </select>
-                <button type="submit">Load</button>
+                <button type="submit">Load Model</button>
               </form>
             </div>
-            <script>
-              document.getElementById('loadModelForm').addEventListener('submit', async (e) => {
-                e.preventDefault();
-                showLoading(`Loading model into memory...`);
-                const res = await fetch('/api/load-model', {
-                  method: 'POST', headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ model_name: document.getElementById('modelSelect').value })
-                });
-                if (res.ok) window.location.reload();
-                else { alert((await res.json()).error); hideLoading(); }
-              });
-            </script>
             {% endif %}
 
             <div class="card">
@@ -557,6 +600,138 @@ jobs:
               <p class="hint">Manage your access tokens in the <a href="/keys" style="color: var(--primary);">API Keys</a> tab.</p>
             </div>
           </div>
+
+          <script>
+            document.getElementById('loadModelForm').addEventListener('submit', async (e) => {
+              e.preventDefault();
+              showLoading(`Loading model into RAM...`);
+              const res = await fetch('/api/load-model', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model_name: document.getElementById('modelSelect').value })
+              });
+              if (res.ok) window.location.reload();
+              else { alert((await res.json()).error); hideLoading(); }
+            });
+
+            async function unloadModel(name) {
+              showLoading(`Unloading model...`);
+              await fetch('/api/unload-model', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model_name: name })
+              });
+              window.location.reload();
+            }
+          </script>
+          {% endblock %}
+          HTMLEOF
+
+          # ---------- playground.html ----------
+          cat > proxy/templates/playground.html << 'HTMLEOF'
+          {% extends "base.html" %}
+          {% block body %}
+          <div class="container">
+            <div class="header">
+              <div class="logo">🚀 <span>AI Suite</span></div>
+              <div class="row">
+                <a href="/" class="nav-link">Dashboard</a>
+                <a href="/playground" class="nav-link active">Playground</a>
+                <a href="/keys" class="nav-link">API Keys</a>
+                <a href="/store" class="nav-link">Store</a>
+                <span class="muted" style="margin: 0;">{{ user }}</span>
+                <a href="/logout" class="btn btn-secondary">Logout</a>
+              </div>
+            </div>
+
+            <div class="card" style="flex: 1; display: flex; flex-direction: column; height: 70vh;">
+              <div class="row" style="margin-bottom: 1rem;">
+                <select id="modelSelect" style="flex: 1; margin: 0;">
+                  {% for m in loaded_models %}
+                  <option value="{{ m }}">{{ m }}</option>
+                  {% else %}
+                  <option value="">No models loaded</option>
+                  {% endfor %}
+                </select>
+              </div>
+              
+              <div id="chatBox" style="flex: 1; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; padding: 1rem; margin-bottom: 1rem; background: rgba(15, 23, 42, 0.6);">
+                <div class="muted" style="text-align: center; margin-top: 2rem;">Start a conversation...</div>
+              </div>
+
+              <form id="chatForm" class="row">
+                <input type="text" id="chatInput" placeholder="Type a message..." style="flex: 1; margin: 0;" required {% if not loaded_models %}disabled{% endif %}>
+                <button type="submit" {% if not loaded_models %}disabled{% endif %}>Send</button>
+              </form>
+            </div>
+          </div>
+
+          <script>
+            const chatBox = document.getElementById('chatBox');
+            const chatForm = document.getElementById('chatForm');
+            const chatInput = document.getElementById('chatInput');
+            const modelSelect = document.getElementById('modelSelect');
+            let history = [];
+
+            function appendMessage(role, text) {
+              const div = document.createElement('div');
+              div.style.marginBottom = '1rem';
+              div.style.padding = '0.75rem';
+              div.style.borderRadius = '8px';
+              div.style.background = role === 'user' ? 'rgba(59, 130, 246, 0.1)' : 'rgba(30, 41, 59, 0.8)';
+              div.innerHTML = `<strong>${role === 'user' ? 'You' : 'AI'}:</strong> ${text}`;
+              chatBox.appendChild(div);
+              chatBox.scrollTop = chatBox.scrollHeight;
+              return div;
+            }
+
+            chatForm.addEventListener('submit', async (e) => {
+              e.preventDefault();
+              const text = chatInput.value;
+              chatInput.value = '';
+              appendMessage('user', text);
+              history.push({ role: 'user', content: text });
+
+              const aiDiv = appendMessage('assistant', '...');
+
+              try {
+                const res = await fetch('/v1/chat/completions', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    model: modelSelect.value,
+                    messages: history,
+                    stream: true
+                  })
+                });
+
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let aiText = '';
+
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  const chunk = decoder.decode(value);
+                  const lines = chunk.split('\n');
+                  
+                  for (const line of lines) {
+                    if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+                      try {
+                        const data = JSON.parse(line.slice(6));
+                        if (data.choices && data.choices[0].delta.content) {
+                          aiText += data.choices[0].delta.content;
+                          aiDiv.innerHTML = `<strong>AI:</strong> ${aiText}`;
+                          chatBox.scrollTop = chatBox.scrollHeight;
+                        }
+                      } catch (err) {}
+                    }
+                  }
+                }
+                history.push({ role: 'assistant', content: aiText });
+              } catch (err) {
+                aiDiv.innerHTML = `<strong>AI:</strong> <span style="color: var(--error)">Error: ${err.message}</span>`;
+              }
+            });
+          </script>
           {% endblock %}
           HTMLEOF
 
@@ -569,6 +744,7 @@ jobs:
               <div class="logo">🚀 <span>AI Suite</span></div>
               <div class="row">
                 <a href="/" class="nav-link">Dashboard</a>
+                <a href="/playground" class="nav-link">Playground</a>
                 <a href="/keys" class="nav-link active">API Keys</a>
                 <a href="/store" class="nav-link">Store</a>
                 <span class="muted" style="margin: 0;">{{ user }}</span>
@@ -699,6 +875,7 @@ jobs:
               <div class="logo">🚀 <span>AI Suite</span></div>
               <div class="row">
                 <a href="/" class="nav-link">Dashboard</a>
+                <a href="/playground" class="nav-link">Playground</a>
                 <a href="/keys" class="nav-link">API Keys</a>
                 <a href="/store" class="nav-link active">Store</a>
                 <span class="muted" style="margin: 0;">{{ user }}</span>
@@ -753,7 +930,6 @@ jobs:
             document.getElementById('searchBtn').addEventListener('click', searchModels);
             document.getElementById('searchInput').addEventListener('keypress', (e) => { if (e.key === 'Enter') searchModels(); });
             
-            // Load initial popular models on page load
             window.onload = searchModels;
 
             async function fetchFiles(repoId, btn) {
