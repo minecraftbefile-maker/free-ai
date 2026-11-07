@@ -199,7 +199,7 @@ jobs:
                           self.last_stats = result["timings"]
                       return result
 
-              def stream_worker(self, model_name: str, messages, q: queue.Queue, **kwargs):
+              def stream_worker(self, model_name: str, messages, q: queue.Queue, stop_event: threading.Event, **kwargs):
                   try:
                       with inference_lock:
                           llm = self.get_model(model_name)
@@ -207,20 +207,27 @@ jobs:
                               messages=messages, max_tokens=kwargs.get("max_tokens", 4096),
                               stream=True, **{k: v for k, v in kwargs.items() if k != "max_tokens"}
                           ):
+                              if stop_event.is_set():
+                                  break
                               q.put(chunk)
                   except Exception as e:
                       q.put({"error": str(e)})
                   finally:
                       q.put(None)
 
-              async def stream_async(self, model_name: str, messages, key_id: str, **kwargs) -> AsyncGenerator[str, None]:
+              async def stream_async(self, model_name: str, messages, key_id: str, request: Request, **kwargs) -> AsyncGenerator[str, None]:
+                  stop_event = threading.Event()
                   q = queue.Queue()
-                  threading.Thread(target=self.stream_worker, args=(model_name, messages, q), kwargs=kwargs, daemon=True).start()
+                  threading.Thread(target=self.stream_worker, args=(model_name, messages, q, stop_event), kwargs=kwargs, daemon=True).start()
                   
                   completion_tokens = 0
                   yield ": keep-alive\n\n" 
 
                   while True:
+                      if await request.is_disconnected():
+                          stop_event.set()
+                          break
+
                       try:
                           chunk = await asyncio.wait_for(asyncio.to_thread(q.get), timeout=15.0)
                       except asyncio.TimeoutError:
@@ -245,7 +252,8 @@ jobs:
                       await asyncio.sleep(0.01)
                   
                   yield "data: [DONE]\n\n"
-                  await asyncio.to_thread(increment_usage, key_id, completion_tokens)
+                  if not await request.is_disconnected():
+                      await asyncio.to_thread(increment_usage, key_id, completion_tokens)
 
               async def generate_async(self, model_name: str, messages, **kwargs):
                   return await asyncio.to_thread(self.generate_sync, model_name, messages, **kwargs)
@@ -391,8 +399,9 @@ jobs:
           @app.post("/api/unload-model")
           async def api_unload_model(request: Request, user: dict = Depends(require_api_user)):
               b = await request.json()
-              await asyncio.to_thread(manager.unload_model, b.get("model_name"))
-              return {"status": "ok"}
+              # Non-blocking unload: return immediately, do the hard work in the background
+              asyncio.create_task(asyncio.to_thread(manager.unload_model, b.get("model_name")))
+              return {"status": "unloading"}
 
           @app.get("/api/store/search")
           async def api_store_search(q: str = "", vision_only: bool = False):
@@ -431,7 +440,7 @@ jobs:
               try:
                   if stream:
                       return StreamingResponse(
-                          manager.stream_async(model_name, messages, user["id"], **body), 
+                          manager.stream_async(model_name, messages, user["id"], request, **body), 
                           media_type="text/event-stream",
                           headers={
                               "Cache-Control": "no-cache",
@@ -616,12 +625,13 @@ jobs:
             });
 
             async function unloadModel(name) {
-              showLoading(`Unloading model...`);
+              showLoading(`Unloading model... (This may take a moment)`);
               await fetch('/api/unload-model', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ model_name: name })
               });
-              window.location.reload();
+              // Give the background thread 3 seconds to free the RAM before reloading
+              setTimeout(() => window.location.reload(), 3000);
             }
           </script>
           {% endblock %}
@@ -656,7 +666,6 @@ jobs:
                 </select>
               </div>
 
-              <!-- System Prompt Editor -->
               <div style="margin-bottom: 1rem;">
                 <details>
                   <summary style="cursor: pointer; color: #94a3b8; font-size: 0.85rem; margin-bottom: 0.5rem;">⚙️ System Prompt</summary>
@@ -735,17 +744,14 @@ jobs:
                         if (data.choices && data.choices[0].delta.content) {
                           aiText += data.choices[0].delta.content;
                           
-                          // --- Thinking Parser & Markdown ---
                           let thinkingHtml = "";
                           let cleanText = aiText;
                           
-                          // Extract completed <think> blocks
                           cleanText = cleanText.replace(/<think>([\s\S]*?)<\/think>/g, (match, p1) => {
                               thinkingHtml += `<details style="margin-bottom: 0.5rem; background: rgba(0,0,0,0.2); border-radius: 4px; padding: 0.5rem;"><summary style="cursor: pointer; color: #94a3b8; font-size: 0.85rem;">🧠 Thinking Process</summary><div style="margin-top: 0.5rem; font-size: 0.85rem; color: #cbd5e1; font-family: monospace; white-space: pre-wrap;">${p1.trim()}</div></details>`;
                               return "";
                           });
                           
-                          // Extract currently open <think> blocks
                           cleanText = cleanText.replace(/<think>([\s\S]*)$/, (match, p1) => {
                               thinkingHtml += `<details open style="margin-bottom: 0.5rem; background: rgba(0,0,0,0.2); border-radius: 4px; padding: 0.5rem;"><summary style="cursor: pointer; color: #94a3b8; font-size: 0.85rem;">🧠 Thinking Process...</summary><div style="margin-top: 0.5rem; font-size: 0.85rem; color: #cbd5e1; font-family: monospace; white-space: pre-wrap;">${p1.trim()}</div></details>`;
                               return "";
