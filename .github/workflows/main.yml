@@ -1,4 +1,4 @@
-name: Ultimate AI Suite (Text < 9B, Image Models, Keys)
+name: AI Text Suite (Text < 9B, Keys, Store)
 
 on:
   workflow_dispatch:
@@ -16,38 +16,6 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Download Pre-built stable-diffusion.cpp (CPU)
-        run: |
-          echo "Fetching the latest release from GitHub API..."
-          LATEST_RELEASE=$(curl -s https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/latest)
-          
-          # Find the asset matching Linux x86_64, explicitly excluding rocm/cuda/vulkan
-          ASSET_URL=$(echo "$LATEST_RELEASE" | jq -r '.assets[] | select(.name | test("bin-Linux.*x86_64.*\\.zip$")) | select(.name | test("rocm|cuda|vulkan") | not) | .browser_download_url' | head -n 1)
-          
-          if [ -z "$ASSET_URL" ]; then
-            echo "❌ Could not find a Linux x86_64 CPU asset."
-            echo "$LATEST_RELEASE" | jq -r '.assets[].name'
-            exit 1
-          fi
-          
-          echo "Downloading: $ASSET_URL"
-          curl -L -o sd.cpp.zip "$ASSET_URL"
-          
-          unzip -q sd.cpp.zip -d sd_bin
-          
-          SD_CLI=$(find sd_bin -name "sd-cli" -type f | head -n 1)
-          if [ -z "$SD_CLI" ]; then
-            echo "❌ sd-cli not found."
-            ls -R sd_bin
-            exit 1
-          fi
-          
-          chmod +x "$SD_CLI"
-          echo "✅ Found sd-cli at: $SD_CLI"
-          
-          mkdir -p stable-diffusion.cpp/build/bin
-          ln -sf "$(pwd)/$SD_CLI" stable-diffusion.cpp/build/bin/sd-cli
-
       - name: Add Swap Space and Optimize Swappiness
         run: |
           sudo fallocate -l 8G /mnt/large-swapfile
@@ -62,7 +30,7 @@ jobs:
           pip install llama-cpp-python[server] \
             --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu \
             --prefer-binary
-          pip install huggingface-hub fastapi uvicorn jinja2 python-multipart itsdangerous pillow
+          pip install huggingface-hub fastapi uvicorn jinja2 python-multipart itsdangerous
 
       - name: Install cloudflared
         run: |
@@ -71,7 +39,7 @@ jobs:
 
       - name: Write Ultimate Proxy Application
         run: |
-          mkdir -p proxy/templates proxy/data proxy/models proxy/sd_models
+          mkdir -p proxy/templates proxy/data proxy/models
 
           cat > proxy/main.py << 'PYEOF'
           import os
@@ -83,8 +51,6 @@ jobs:
           import traceback
           import threading
           import asyncio
-          import subprocess
-          import base64
           import datetime
           from pathlib import Path
           from typing import Optional, AsyncGenerator, List, Dict, Any
@@ -108,13 +74,9 @@ jobs:
           CONFIG_FILE = BASE_DIR / "data" / "config.json"
           KEYS_FILE = BASE_DIR / "data" / "keys.json"
           MODELS_DIR = BASE_DIR / "models"
-          SD_MODELS_DIR = BASE_DIR / "sd_models"
           TEMPLATES_DIR = BASE_DIR / "templates"
           MODELS_DIR.mkdir(exist_ok=True)
-          SD_MODELS_DIR.mkdir(exist_ok=True)
           CONFIG_FILE.parent.mkdir(exist_ok=True)
-
-          SD_BIN = BASE_DIR.parent / "stable-diffusion.cpp" / "build" / "bin" / "sd-cli"
 
           app = FastAPI()
           app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
@@ -123,56 +85,6 @@ jobs:
 
           state_lock = threading.Lock()
           inference_lock = threading.Lock()
-          image_lock = threading.Lock()
-
-          # ---------- Expanded Small Image Models ----------
-          POPULAR_IMAGE_MODELS = [
-              {
-                  "id": "stabilityai/sd-turbo",
-                  "name": "SD-Turbo (Fast, Small)",
-                  "filename": "sd_turbo.safetensors",
-                  "repo_id": "stabilityai/sd-turbo",
-                  "type": "image",
-                  "size": "small",
-                  "steps": 1
-              },
-              {
-                  "id": "runwayml/stable-diffusion-v1-5",
-                  "name": "SD 1.5 (Classic, Small)",
-                  "filename": "v1-5-pruned-emaonly.safetensors",
-                  "repo_id": "runwayml/stable-diffusion-v1-5",
-                  "type": "image",
-                  "size": "small",
-                  "steps": 25
-              },
-              {
-                  "id": "stabilityai/stable-diffusion-2-1",
-                  "name": "SD 2.1 (Improved, Small)",
-                  "filename": "v2-1_768-ema-pruned.safetensors",
-                  "repo_id": "stabilityai/stable-diffusion-2-1",
-                  "type": "image",
-                  "size": "small",
-                  "steps": 25
-              },
-              {
-                  "id": "OlegSkutte/sdxl-turbo-GGUF",
-                  "name": "SDXL-Turbo (GGUF, Medium)",
-                  "filename": "sd_xl_turbo_1.0.q8_0.gguf",
-                  "repo_id": "OlegSkutte/sdxl-turbo-GGUF",
-                  "type": "image",
-                  "size": "medium",
-                  "steps": 1
-              },
-              {
-                  "id": "FINAL-Bench/POCKET-Zimage-CPU",
-                  "name": "POCKET-Zimage (3 steps)",
-                  "filename": "z_image_turbo-Q4_0-pocket.gguf",
-                  "repo_id": "FINAL-Bench/POCKET-Zimage-CPU",
-                  "type": "image",
-                  "size": "small",
-                  "steps": 3
-              }
-          ]
 
           # ---------- Key Management System ----------
           def load_keys() -> List[Dict[str, Any]]:
@@ -206,55 +118,6 @@ jobs:
                           break
                   save_keys(keys)
 
-          # ---------- Image Generation Manager ----------
-          class ImageManager:
-              def __init__(self):
-                  self.current_model = None
-
-              def download_model(self, repo_id: str, filename: str):
-                  print(f"[image] Downloading {repo_id}/{filename}...", flush=True)
-                  hf_hub_download(repo_id=repo_id, filename=filename, local_dir=str(SD_MODELS_DIR))
-                  if "POCKET-Zimage" in repo_id:
-                      hf_hub_download(repo_id="Tongyi-MAI/Z-Image-Turbo", filename="vae/diffusion_pytorch_model.safetensors", local_dir=str(SD_MODELS_DIR))
-                      hf_hub_download(repo_id="lmstudio-community/Qwen3-4B-Instruct-2507-GGUF", filename="Qwen3-4B-Instruct-2507-Q4_K_M.gguf", local_dir=str(SD_MODELS_DIR))
-
-              def generate(self, prompt: str, steps: int = 4, width: int = 512, height: int = 512):
-                  if not self.current_model:
-                      raise RuntimeError("No image model selected. Go to the Store and select one.")
-
-                  with image_lock:
-                      output_file = str(BASE_DIR / f"tmp_{uuid.uuid4().hex}.png")
-                      model_file = SD_MODELS_DIR / self.current_model["filename"]
-
-                      cmd = [
-                          str(SD_BIN), "-M", "img_gen",
-                          "--diffusion-model", str(model_file),
-                          "-p", prompt, "--cfg-scale", "1.0",
-                          "-H", str(height), "-W", str(width),
-                          "--steps", str(steps),
-                          "--offload-to-cpu", "--diffusion-fa", "--vae-tiling",
-                          "-o", output_file
-                      ]
-
-                      if "POCKET-Zimage" in self.current_model["id"]:
-                          cmd.extend([
-                              "--vae", str(SD_MODELS_DIR / "vae" / "diffusion_pytorch_model.safetensors"),
-                              "--llm", str(SD_MODELS_DIR / "Qwen3-4B-Instruct-2507-Q4_K_M.gguf")
-                          ])
-
-                      print(f"[image] Generating: '{prompt}'...", flush=True)
-                      result = subprocess.run(cmd, capture_output=True, text=True)
-
-                      if result.returncode != 0:
-                          raise RuntimeError(f"sd-cli failed: {result.stderr[:200]}")
-
-                      with open(output_file, "rb") as f:
-                          img_str = base64.b64encode(f.read()).decode("utf-8")
-                      os.remove(output_file)
-                      return img_str
-
-          image_manager = ImageManager()
-
           # ---------- Model Manager (Text) ----------
           class ModelManager:
               def __init__(self):
@@ -268,12 +131,88 @@ jobs:
                           try: self.current_llm.close()
                           except: pass
                           self.current_llm = None
+                      
+                      is_vision = any(tag in model_name.lower() for tag in ["vision", "vl", "llava"])
+                      chat_handler = None
+                      if is_vision and MTMDChatHandler is not None:
+                          try: chat_handler = MTMDChatHandler()
+                          except: pass
+                          
                       safe_threads = max(1, (os.cpu_count() or 4) - 1)
-                      self.current_llm = Llama(
-                          model_path=model_path, n_ctx=4096, n_threads=safe_threads,
-                          n_gpu_layers=0, use_mlock=True, verbose=False
-                      )
+                      
+                      try:
+                          self.current_llm = Llama(
+                              model_path=model_path, n_ctx=4096, n_threads=safe_threads,
+                              n_gpu_layers=0, use_mlock=True, verbose=False,
+                              chat_handler=chat_handler
+                          )
+                      except Exception:
+                          self.current_llm = Llama(
+                              model_path=model_path, n_ctx=4096, n_threads=safe_threads,
+                              n_gpu_layers=0, use_mlock=True, verbose=False
+                          )
                       self.current_model_name = model_name
+
+              def generate_sync(self, messages, **kwargs):
+                  with inference_lock:
+                      t0 = time.time()
+                      result = self.current_llm.create_chat_completion(
+                          messages=messages, max_tokens=kwargs.get("max_tokens", 4096),
+                          **{k: v for k, v in kwargs.items() if k != "max_tokens"}
+                      )
+                      elapsed = time.time() - t0
+                      if isinstance(result, dict):
+                          result["model"] = self.current_model_name
+                          usage = result.get("usage", {})
+                          completion_tokens = usage.get("completion_tokens", 0)
+                          tps = completion_tokens / elapsed if elapsed > 0 else 0
+                          result["timings"] = {
+                              "total_time": round(elapsed, 3),
+                              "completion_tokens": completion_tokens,
+                              "tokens_per_second": round(tps, 2),
+                          }
+                          self.last_stats = result["timings"]
+                      return result
+
+              def stream_sync(self, messages, **kwargs) -> AsyncGenerator[dict, None]:
+                  t0 = time.time()
+                  completion_tokens = 0
+                  with inference_lock:
+                      for chunk in self.current_llm.create_chat_completion(
+                          messages=messages, max_tokens=kwargs.get("max_tokens", 4096),
+                          stream=True, **{k: v for k, v in kwargs.items() if k != "max_tokens"}
+                      ):
+                          if isinstance(chunk, dict):
+                              chunk["model"] = self.current_model_name
+                              if chunk.get("choices"):
+                                  delta = chunk["choices"][0].get("delta", {})
+                                  if delta.get("content") or delta.get("tool_calls"):
+                                      completion_tokens += 1
+                          yield chunk
+                  
+                  elapsed = time.time() - t0
+                  tps = completion_tokens / elapsed if elapsed > 0 else 0
+                  self.last_stats = {"total_time": round(elapsed, 3), "completion_tokens": completion_tokens, "tokens_per_second": round(tps, 2)}
+                  yield {
+                      "id": f"chatcmpl-{uuid.uuid4()}", "object": "chat.completion.chunk",
+                      "created": int(time.time()), "model": self.current_model_name, "choices": [],
+                      "usage": {"completion_tokens": completion_tokens, "total_tokens": completion_tokens},
+                      "timings": self.last_stats,
+                  }
+
+              async def generate_async(self, messages, **kwargs):
+                  if self.current_llm is None: raise RuntimeError("No model loaded")
+                  return await asyncio.to_thread(self.generate_sync, messages, **kwargs)
+
+              async def stream_async(self, messages, key_id: str, **kwargs) -> AsyncGenerator[str, None]:
+                  if self.current_llm is None: raise RuntimeError("No model loaded")
+                  completion_tokens = 0
+                  for chunk in self.stream_sync(messages, **kwargs):
+                      if chunk.get("usage"): completion_tokens = chunk["usage"]["completion_tokens"]
+                      yield f"data: {json.dumps(chunk)}\n\n"
+                      await asyncio.sleep(0.01)
+                  yield "data: [DONE]\n\n"
+                  await asyncio.to_thread(increment_usage, key_id, completion_tokens)
 
           manager = ModelManager()
 
@@ -365,11 +304,7 @@ jobs:
 
           @app.get("/store", response_class=HTMLResponse)
           async def store_page(request: Request, user: str = Depends(require_user)):
-              return templates.TemplateResponse(request, "store.html", {"user": user, "popular_image_models": POPULAR_IMAGE_MODELS, "current_image_model": image_manager.current_model})
-
-          @app.get("/image", response_class=HTMLResponse)
-          async def image_page(request: Request, user: str = Depends(require_user)):
-              return templates.TemplateResponse(request, "image.html", {"user": user, "current_model": image_manager.current_model})
+              return templates.TemplateResponse(request, "store.html", {"user": user})
 
           # ---------- Management APIs ----------
           @app.get("/api/keys")
@@ -403,27 +338,41 @@ jobs:
               await asyncio.to_thread(manager.load_model, str(path), b.get("model_name"))
               return {"status": "ok"}
 
-          @app.post("/api/store/select-image-model")
-          async def api_select_image_model(request: Request, user: dict = Depends(require_api_user)):
-              b = await request.json()
-              model_info = next((m for m in POPULAR_IMAGE_MODELS if m["id"] == b.get("model_id")), None)
-              if not model_info: raise HTTPException(404, "Model not found")
-              
-              await asyncio.to_thread(image_manager.download_model, model_info["repo_id"], model_info["filename"])
-              image_manager.current_model = model_info
-              return {"status": "ok", "model": model_info}
-
           @app.get("/api/store/search")
-          async def api_store_search(q: str = "", model_type: str = "text", vision_only: bool = False):
-              if model_type == "image":
-                  return [m for m in POPULAR_IMAGE_MODELS if q.lower() in m["name"].lower()]
-              
-              models = await asyncio.to_thread(hf_api.list_models, search=q, filter="gguf", sort="downloads", limit=30, expand=["tags"], num_parameters="max:9B")
-              res = []
-              for m in models:
-                  is_v = any(t in (m.tags or []) for t in ["vision", "multimodal"])
-                  if not vision_only or is_v: res.append({"id": m.id, "downloads": m.downloads, "is_vision": is_v})
-              return res
+          async def api_store_search(q: str = "", vision_only: bool = False):
+              try:
+                  # 1. Primary Search: Strict Text-Generation + GGUF + Max 9B
+                  models = await asyncio.to_thread(
+                      hf_api.list_models,
+                      search=q,
+                      filter="gguf",
+                      pipeline_tag="text-generation",
+                      num_parameters="max:9B",
+                      sort="downloads",
+                      limit=30,
+                      expand=["tags"]
+                  )
+                  
+                  # 2. Fallback: If no models found (HF metadata missing param count), drop the 9B limit
+                  if not models:
+                      models = await asyncio.to_thread(
+                          hf_api.list_models,
+                          search=q,
+                          filter="gguf",
+                          pipeline_tag="text-generation",
+                          sort="downloads",
+                          limit=30,
+                          expand=["tags"]
+                      )
+                      
+                  res = []
+                  for m in models:
+                      is_v = any(t in (m.tags or []) for t in ["vision", "multimodal"])
+                      if not vision_only or is_v: 
+                          res.append({"id": m.id, "downloads": m.downloads, "is_vision": is_v})
+                  return res
+              except Exception as e:
+                  return JSONResponse(status_code=500, content={"error": str(e)})
 
           @app.get("/api/store/files")
           async def api_store_files(repo_id: str, user: dict = Depends(require_api_user)):
@@ -436,20 +385,18 @@ jobs:
               await asyncio.to_thread(hf_hub_download, repo_id=b.get("repo_id"), filename=b.get("filename"), local_dir=str(MODELS_DIR))
               return {"status": "ok"}
 
-          # ---------- AI APIs ----------
-          @app.post("/v1/images/generations")
-          async def generate_image(request: Request, user: dict = Depends(require_api_user)):
+          # ---------- OpenAI-compatible API ----------
+          @app.post("/v1/chat/completions")
+          async def chat_completions(request: Request, user: dict = Depends(require_api_user)):
+              body = await request.json()
+              messages, stream = body.pop("messages", []), body.pop("stream", False)
               try:
-                  body = await request.json()
-                  prompt = body.get("prompt", "")
-                  if not prompt: raise HTTPException(status_code=400, detail="Prompt is required")
-                  
-                  steps = body.get("steps", image_manager.current_model["steps"] if image_manager.current_model else 4)
-                  img_b64 = await asyncio.to_thread(image_manager.generate, prompt, steps, body.get("width", 512), body.get("height", 512))
-                  
-                  return {"created": int(time.time()), "data": [{"b64_json": img_b64}]}
-              except Exception as e:
-                  return JSONResponse(status_code=500, content={"error": str(e)})
+                  if stream:
+                      return StreamingResponse(manager.stream_async(messages, user["id"], **body), media_type="text/event-stream")
+                  res = await manager.generate_async(messages, **body)
+                  await asyncio.to_thread(increment_usage, user["id"], res.get("usage", {}).get("completion_tokens", 0))
+                  return JSONResponse(content=res)
+              except Exception as e: return JSONResponse(status_code=500, content={"error": str(e)})
 
           @app.get("/health")
           async def health():
@@ -555,7 +502,6 @@ jobs:
               <div class="logo">🚀 <span>AI Suite</span></div>
               <div class="row">
                 <a href="/" class="nav-link active">Dashboard</a>
-                <a href="/image" class="nav-link">Image Gen</a>
                 <a href="/keys" class="nav-link">API Keys</a>
                 <a href="/store" class="nav-link">Store</a>
                 <span class="muted" style="margin: 0;">{{ user }}</span>
@@ -614,98 +560,6 @@ jobs:
           {% endblock %}
           HTMLEOF
 
-          # ---------- image.html ----------
-          cat > proxy/templates/image.html << 'HTMLEOF'
-          {% extends "base.html" %}
-          {% block body %}
-          <div class="container">
-            <div class="header">
-              <div class="logo">🚀 <span>AI Suite</span></div>
-              <div class="row">
-                <a href="/" class="nav-link">Dashboard</a>
-                <a href="/image" class="nav-link active">Image Gen</a>
-                <a href="/keys" class="nav-link">API Keys</a>
-                <a href="/store" class="nav-link">Store</a>
-                <span class="muted" style="margin: 0;">{{ user }}</span>
-                <a href="/logout" class="btn btn-secondary">Logout</a>
-              </div>
-            </div>
-
-            <div class="card">
-              <h2>Generate Image</h2>
-              <p class="muted" style="margin-bottom: 1rem;">
-                {% if current_model %}
-                  Using: <strong>{{ current_model.name }}</strong>
-                {% else %}
-                  No model selected. Please go to the <a href="/store" style="color: var(--primary);">Store</a> to download one.
-                {% endif %}
-              </p>
-              
-              <form id="imageForm" {% if not current_model %}style="opacity: 0.5; pointer-events: none;"{% endif %}>
-                <label>Prompt</label>
-                <input type="text" id="prompt" placeholder="A futuristic city, cyberpunk style" required>
-                <div class="row" style="margin-bottom: 1rem;">
-                  <div style="flex: 1;">
-                    <label>Width</label>
-                    <select id="width">
-                      <option value="512">512</option>
-                      <option value="256">256</option>
-                    </select>
-                  </div>
-                  <div style="flex: 1;">
-                    <label>Height</label>
-                    <select id="height">
-                      <option value="512">512</option>
-                      <option value="256">256</option>
-                    </select>
-                  </div>
-                  <div style="flex: 1;">
-                    <label>Steps</label>
-                    <input type="number" id="steps" value="{{ current_model.steps if current_model else 4 }}" min="1" max="10">
-                  </div>
-                </div>
-                <button type="submit" style="width: 100%;">Generate</button>
-              </form>
-            </div>
-
-            <div id="resultContainer" class="card" style="display: none; text-align: center;">
-              <h2>Result</h2>
-              <img id="resultImage" style="max-width: 100%; border-radius: 8px; margin-top: 1rem;">
-            </div>
-          </div>
-
-          <script>
-            document.getElementById('imageForm').addEventListener('submit', async (e) => {
-              e.preventDefault();
-              showLoading('Generating image...<br><small>This takes ~30-60s on CPU.</small>');
-              
-              try {
-                const res = await fetch('/v1/images/generations', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    prompt: document.getElementById('prompt').value,
-                    width: parseInt(document.getElementById('width').value),
-                    height: parseInt(document.getElementById('height').value),
-                    steps: parseInt(document.getElementById('steps').value)
-                  })
-                });
-                
-                const data = await res.json();
-                if (!res.ok) throw new Error(data.error || 'Generation failed');
-                
-                document.getElementById('resultImage').src = `data:image/png;base64,${data.data[0].b64_json}`;
-                document.getElementById('resultContainer').style.display = 'block';
-                hideLoading();
-              } catch (err) {
-                alert(err.message);
-                hideLoading();
-              }
-            });
-          </script>
-          {% endblock %}
-          HTMLEOF
-
           # ---------- keys.html ----------
           cat > proxy/templates/keys.html << 'HTMLEOF'
           {% extends "base.html" %}
@@ -715,7 +569,6 @@ jobs:
               <div class="logo">🚀 <span>AI Suite</span></div>
               <div class="row">
                 <a href="/" class="nav-link">Dashboard</a>
-                <a href="/image" class="nav-link">Image Gen</a>
                 <a href="/keys" class="nav-link active">API Keys</a>
                 <a href="/store" class="nav-link">Store</a>
                 <span class="muted" style="margin: 0;">{{ user }}</span>
@@ -846,7 +699,6 @@ jobs:
               <div class="logo">🚀 <span>AI Suite</span></div>
               <div class="row">
                 <a href="/" class="nav-link">Dashboard</a>
-                <a href="/image" class="nav-link">Image Gen</a>
                 <a href="/keys" class="nav-link">API Keys</a>
                 <a href="/store" class="nav-link active">Store</a>
                 <span class="muted" style="margin: 0;">{{ user }}</span>
@@ -855,12 +707,8 @@ jobs:
             </div>
 
             <div class="card">
-              <h2>Discover Models</h2>
+              <h2>Discover Text Models</h2>
               <div class="row" style="margin-bottom: 1rem;">
-                <select id="modelType" style="width: auto; margin: 0;">
-                  <option value="text">Text Models (< 9B)</option>
-                  <option value="image">Image Models</option>
-                </select>
                 <input type="text" id="searchInput" placeholder="Search model name..." style="margin: 0; flex: 1;">
                 <button id="searchBtn" style="margin: 0;">Search</button>
               </div>
@@ -875,10 +723,9 @@ jobs:
           <script>
             async function searchModels() {
               const q = document.getElementById('searchInput').value;
-              const type = document.getElementById('modelType').value;
               
               showLoading('Searching...');
-              const url = `/api/store/search?q=${encodeURIComponent(q)}&model_type=${type}`;
+              const url = `/api/store/search?q=${encodeURIComponent(q)}`;
               const res = await fetch(url);
               const models = await res.json();
               hideLoading();
@@ -886,36 +733,20 @@ jobs:
               const list = document.getElementById('resultsList');
               list.innerHTML = models.length ? '' : '<p class="muted">No models found.</p>';
               
-              if (type === 'image') {
-                models.forEach(m => {
-                  list.innerHTML += `
-                    <div class="row" style="border-bottom: 1px solid var(--border); padding: 0.75rem 0;">
-                      <div style="flex: 1;">
-                        <div style="font-weight: 600;">${m.name}</div>
-                        <div class="muted">Repo: ${m.id}</div>
-                      </div>
-                      <div>
-                        <button class="btn-secondary" onclick="selectImageModel('${m.id}')">Select</button>
-                      </div>
+              models.forEach(m => {
+                const safeId = m.id.replace(/[^a-zA-Z0-9]/g, '_');
+                list.innerHTML += `
+                  <div class="row" style="border-bottom: 1px solid var(--border); padding: 0.75rem 0;">
+                    <div style="flex: 1;">
+                      <div style="font-weight: 600;">${m.id} ${m.is_vision ? '<span class="badge loaded">Vision</span>' : ''}</div>
+                      <div class="muted">${m.downloads} downloads</div>
                     </div>
-                  `;
-                });
-              } else {
-                models.forEach(m => {
-                  const safeId = m.id.replace(/[^a-zA-Z0-9]/g, '_');
-                  list.innerHTML += `
-                    <div class="row" style="border-bottom: 1px solid var(--border); padding: 0.75rem 0;">
-                      <div style="flex: 1;">
-                        <div style="font-weight: 600;">${m.id} ${m.is_vision ? '<span class="badge loaded">Vision</span>' : ''}</div>
-                        <div class="muted">${m.downloads} downloads</div>
-                      </div>
-                      <div id="actions_${safeId}">
-                        <button class="btn-secondary" onclick="fetchFiles('${m.id}', this)">Get Files</button>
-                      </div>
+                    <div id="actions_${safeId}">
+                      <button class="btn-secondary" onclick="fetchFiles('${m.id}', this)">Get Files</button>
                     </div>
-                  `;
-                });
-              }
+                  </div>
+                `;
+              });
               document.getElementById('resultsContainer').style.display = 'block';
             }
 
@@ -924,20 +755,6 @@ jobs:
             
             // Load initial popular models on page load
             window.onload = searchModels;
-
-            async function selectImageModel(modelId) {
-              showLoading('Downloading image model... This may take a minute.');
-              const res = await fetch('/api/store/select-image-model', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ model_id: modelId })
-              });
-              if (res.ok) {
-                alert('Image model selected successfully!');
-                window.location.href = '/image';
-              } else {
-                alert('Failed to select model.'); hideLoading();
-              }
-            }
 
             async function fetchFiles(repoId, btn) {
               btn.innerText = 'Fetching...';
