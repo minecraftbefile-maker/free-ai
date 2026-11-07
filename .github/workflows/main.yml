@@ -1,4 +1,4 @@
-name: Ultimate AI Suite (Multi-Model, Playground, Keys)
+name: Ultimate AI Suite (Multi-Model, Playground, Keys, Tools)
 
 on:
   workflow_dispatch:
@@ -30,7 +30,7 @@ jobs:
           pip install llama-cpp-python[server] \
             --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu \
             --prefer-binary
-          pip install huggingface-hub fastapi uvicorn jinja2 python-multipart itsdangerous psutil
+          pip install huggingface-hub[hf_transfer] fastapi uvicorn jinja2 python-multipart itsdangerous psutil
 
       - name: Install cloudflared
         run: |
@@ -43,6 +43,8 @@ jobs:
 
           cat > proxy/main.py << 'PYEOF'
           import os
+          os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+
           import json
           import uuid
           import hashlib
@@ -181,10 +183,14 @@ jobs:
                   with inference_lock:
                       llm = self.get_model(model_name)
                       t0 = time.time()
+                      max_tokens = kwargs.pop("max_tokens", 4096)
+                      
                       result = llm.create_chat_completion(
-                          messages=messages, max_tokens=kwargs.get("max_tokens", 4096),
-                          **{k: v for k, v in kwargs.items() if k != "max_tokens"}
+                          messages=messages, 
+                          max_tokens=max_tokens,
+                          **kwargs # Passes tools, tool_choice, temperature, etc.
                       )
+                      
                       elapsed = time.time() - t0
                       if isinstance(result, dict):
                           result["model"] = model_name
@@ -203,9 +209,13 @@ jobs:
                   try:
                       with inference_lock:
                           llm = self.get_model(model_name)
+                          max_tokens = kwargs.pop("max_tokens", 4096)
+                          
                           for chunk in llm.create_chat_completion(
-                              messages=messages, max_tokens=kwargs.get("max_tokens", 4096),
-                              stream=True, **{k: v for k, v in kwargs.items() if k != "max_tokens"}
+                              messages=messages, 
+                              max_tokens=max_tokens,
+                              stream=True, 
+                              **kwargs
                           ):
                               if stop_event.is_set():
                                   break
@@ -399,7 +409,6 @@ jobs:
           @app.post("/api/unload-model")
           async def api_unload_model(request: Request, user: dict = Depends(require_api_user)):
               b = await request.json()
-              # Non-blocking unload: return immediately, do the hard work in the background
               asyncio.create_task(asyncio.to_thread(manager.unload_model, b.get("model_name")))
               return {"status": "unloading"}
 
@@ -432,6 +441,19 @@ jobs:
               return {"status": "ok"}
 
           # ---------- OpenAI-compatible API ----------
+          @app.get("/v1/models")
+          async def list_models(user: dict = Depends(require_api_user)):
+              loaded = list(manager.models.keys())
+              data = []
+              for m in loaded:
+                  data.append({
+                      "id": m,
+                      "object": "model",
+                      "created": int(time.time()),
+                      "owned_by": "local"
+                  })
+              return {"object": "list", "data": data}
+
           @app.post("/v1/chat/completions")
           async def chat_completions(request: Request, user: dict = Depends(require_api_user)):
               body = await request.json()
@@ -442,15 +464,36 @@ jobs:
                       return StreamingResponse(
                           manager.stream_async(model_name, messages, user["id"], request, **body), 
                           media_type="text/event-stream",
-                          headers={
-                              "Cache-Control": "no-cache",
-                              "Connection": "keep-alive",
-                              "X-Accel-Buffering": "no"
-                          }
+                          headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
                       )
                   res = await manager.generate_async(model_name, messages, **body)
                   await asyncio.to_thread(increment_usage, user["id"], res.get("usage", {}).get("completion_tokens", 0))
                   return JSONResponse(content=res)
+              except Exception as e: 
+                  return JSONResponse(status_code=500, content={"error": str(e)})
+
+          @app.post("/v1/completions")
+          async def legacy_completions(request: Request, user: dict = Depends(require_api_user)):
+              body = await request.json()
+              model_name = body.pop("model", "auto")
+              prompt = body.pop("prompt", "")
+              messages = [{"role": "user", "content": prompt}]
+              try:
+                  res = await manager.generate_async(model_name, messages, **body)
+                  await asyncio.to_thread(increment_usage, user["id"], res.get("usage", {}).get("completion_tokens", 0))
+                  return JSONResponse(content={
+                      "id": f"cmpl-{uuid.uuid4()}",
+                      "object": "text_completion",
+                      "created": int(time.time()),
+                      "model": model_name,
+                      "choices": [{
+                          "text": res["choices"][0]["message"]["content"],
+                          "index": 0,
+                          "logprobs": None,
+                          "finish_reason": res["choices"][0].get("finish_reason", "stop")
+                      }],
+                      "usage": res.get("usage", {})
+                  })
               except Exception as e: 
                   return JSONResponse(status_code=500, content={"error": str(e)})
 
@@ -630,7 +673,6 @@ jobs:
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ model_name: name })
               });
-              // Give the background thread 3 seconds to free the RAM before reloading
               setTimeout(() => window.location.reload(), 3000);
             }
           </script>
@@ -668,8 +710,23 @@ jobs:
 
               <div style="margin-bottom: 1rem;">
                 <details>
-                  <summary style="cursor: pointer; color: #94a3b8; font-size: 0.85rem; margin-bottom: 0.5rem;">⚙️ System Prompt</summary>
-                  <textarea id="systemPrompt" rows="3" placeholder="You are a helpful assistant. Answer directly without showing your thinking process.">You are a helpful assistant. Answer directly without showing your thinking process.</textarea>
+                  <summary style="cursor: pointer; color: #94a3b8; font-size: 0.85rem; margin-bottom: 0.5rem;">⚙️ System Prompt & Generation Settings</summary>
+                  
+                  <div style="margin-top: 0.5rem;">
+                    <label>System Prompt</label>
+                    <textarea id="systemPrompt" rows="2">You are a helpful assistant. Answer directly without showing your thinking process.</textarea>
+                  </div>
+                  
+                  <div class="row">
+                    <div style="flex: 1;">
+                      <label>Temperature</label>
+                      <input type="number" id="tempInput" value="0.7" step="0.1" min="0" max="2">
+                    </div>
+                    <div style="flex: 1;">
+                      <label>Max Tokens</label>
+                      <input type="number" id="maxTokensInput" value="2048" step="128" min="1">
+                    </div>
+                  </div>
                 </details>
               </div>
               
@@ -690,6 +747,8 @@ jobs:
             const chatInput = document.getElementById('chatInput');
             const modelSelect = document.getElementById('modelSelect');
             const systemPromptInput = document.getElementById('systemPrompt');
+            const tempInput = document.getElementById('tempInput');
+            const maxTokensInput = document.getElementById('maxTokensInput');
             let history = [];
 
             function appendMessage(role, text) {
@@ -715,6 +774,8 @@ jobs:
               
               let sysPrompt = systemPromptInput.value.trim();
               let messagesToSend = sysPrompt ? [{ role: 'system', content: sysPrompt }, ...history] : history;
+              let temp = parseFloat(tempInput.value) || 0.7;
+              let maxTokens = parseInt(maxTokensInput.value) || 2048;
 
               try {
                 const res = await fetch('/v1/chat/completions', {
@@ -723,7 +784,9 @@ jobs:
                   body: JSON.stringify({
                     model: modelSelect.value,
                     messages: messagesToSend,
-                    stream: true
+                    stream: true,
+                    temperature: temp,
+                    max_tokens: maxTokens
                   })
                 });
 
@@ -741,8 +804,15 @@ jobs:
                     if (line.startsWith('data: ') && line !== 'data: [DONE]') {
                       try {
                         const data = JSON.parse(line.slice(6));
-                        if (data.choices && data.choices[0].delta.content) {
-                          aiText += data.choices[0].delta.content;
+                        if (data.choices && data.choices[0].delta) {
+                          const delta = data.choices[0].delta;
+                          
+                          if (delta.content) {
+                              aiText += delta.content;
+                          }
+                          if (delta.tool_calls) {
+                              aiText += `\n\n🛠️ **Tool Call:**\n\`\`\`json\n${JSON.stringify(delta.tool_calls, null, 2)}\n\`\`\`\n`;
+                          }
                           
                           let thinkingHtml = "";
                           let cleanText = aiText;
@@ -988,7 +1058,7 @@ jobs:
 
             async function downloadSelected(repoId, selectId) {
               const filename = document.getElementById(selectId).value;
-              showLoading(`Downloading ${filename}...<br><small>This may take a few minutes.</small>`);
+              showLoading(`Downloading ${filename}...<br><small>Maxing out connection speed. This may take a minute.</small>`);
               const res = await fetch('/api/download-model', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ repo_id: repoId, filename: filename })
