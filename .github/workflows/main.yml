@@ -1,4 +1,4 @@
-name: Ultimate AI Suite (Multi-Model, Playground, Keys, Tools)
+name: Ultimate AI Suite (Max Speed Optimized)
 
 on:
   workflow_dispatch:
@@ -30,7 +30,7 @@ jobs:
           pip install llama-cpp-python[server] \
             --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu \
             --prefer-binary
-          pip install huggingface-hub[hf_transfer] fastapi uvicorn jinja2 python-multipart itsdangerous psutil
+          pip install huggingface-hub fastapi uvicorn jinja2 python-multipart itsdangerous psutil
 
       - name: Install cloudflared
         run: |
@@ -43,7 +43,16 @@ jobs:
 
           cat > proxy/main.py << 'PYEOF'
           import os
-          os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+          # --- PERFORMANCE OPTIMIZATIONS ---
+          # Enable HF Xet for maximum download speed
+          os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
+          os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1" # Fallback
+          
+          # Prevent OpenMP and BLAS from over-subscribing threads
+          cpu_count = os.cpu_count() or 4
+          physical_cores = max(1, cpu_count // 2) if cpu_count > 2 else cpu_count
+          os.environ["OMP_NUM_THREADS"] = str(cpu_count)
+          os.environ["OPENBLAS_NUM_THREADS"] = str(cpu_count)
 
           import json
           import uuid
@@ -150,18 +159,36 @@ jobs:
                           try: chat_handler = MTMDChatHandler()
                           except: pass
                           
-                      safe_threads = max(1, (os.cpu_count() or 4) - 1)
+                      # OPTIMIZATION: Use physical cores for generation, all logical cores for batch
+                      print(f"[perf] CPU: {cpu_count} logical, {physical_cores} physical")
+                      print(f"[perf] Threads -> Gen: {physical_cores}, Batch: {cpu_count}")
                       
                       try:
                           llm = Llama(
-                              model_path=model_path, n_ctx=4096, n_threads=safe_threads,
-                              n_gpu_layers=0, use_mlock=True, verbose=False,
+                              model_path=model_path, 
+                              n_ctx=4096, 
+                              n_threads=physical_cores, # Prevent context switching overhead
+                              n_threads_batch=cpu_count, # Max out prompt processing
+                              n_batch=512,               # Swallow large prompts instantly
+                              n_gpu_layers=0, 
+                              use_mlock=True,            # Lock in RAM
+                              use_mmap=True,             # Memory map
+                              flash_attn=True,           # Faster attention
+                              verbose=False,
                               chat_handler=chat_handler
                           )
-                      except Exception:
+                      except Exception as e:
+                          print(f"[perf] Flash attention or handler failed, falling back: {e}")
                           llm = Llama(
-                              model_path=model_path, n_ctx=4096, n_threads=safe_threads,
-                              n_gpu_layers=0, use_mlock=True, verbose=False
+                              model_path=model_path, 
+                              n_ctx=4096, 
+                              n_threads=physical_cores,
+                              n_threads_batch=cpu_count,
+                              n_batch=512,
+                              n_gpu_layers=0, 
+                              use_mlock=True,
+                              use_mmap=True,
+                              verbose=False
                           )
                       self.models[model_name] = llm
 
@@ -183,12 +210,12 @@ jobs:
                   with inference_lock:
                       llm = self.get_model(model_name)
                       t0 = time.time()
-                      max_tokens = kwargs.pop("max_tokens", 4096)
+                      max_tokens = kwargs.pop("max_tokens", 2048)
                       
                       result = llm.create_chat_completion(
                           messages=messages, 
                           max_tokens=max_tokens,
-                          **kwargs # Passes tools, tool_choice, temperature, etc.
+                          **kwargs
                       )
                       
                       elapsed = time.time() - t0
@@ -209,7 +236,7 @@ jobs:
                   try:
                       with inference_lock:
                           llm = self.get_model(model_name)
-                          max_tokens = kwargs.pop("max_tokens", 4096)
+                          max_tokens = kwargs.pop("max_tokens", 2048)
                           
                           for chunk in llm.create_chat_completion(
                               messages=messages, 
@@ -530,6 +557,7 @@ jobs:
               .input-group { display: flex; gap: 0.5rem; }
               .badge { padding: 0.25rem 0.5rem; border-radius: 999px; font-size: 0.75rem; font-weight: 600; }
               .badge.loaded { background: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.3); }
+              .badge.speed { background: rgba(59, 130, 246, 0.15); color: var(--primary); border: 1px solid rgba(59, 130, 246, 0.3); }
               .muted { color: #94a3b8; font-size: 0.9rem; }
               .nav-link { color: #94a3b8; text-decoration: none; font-size: 0.875rem; padding: 0.5rem 1rem; border-radius: 8px; }
               .nav-link:hover { background: rgba(148, 163, 184, 0.1); color: white; }
@@ -724,7 +752,11 @@ jobs:
                     </div>
                     <div style="flex: 1;">
                       <label>Max Tokens</label>
-                      <input type="number" id="maxTokensInput" value="2048" step="128" min="1">
+                      <input type="number" id="maxTokensInput" value="1024" step="128" min="1">
+                    </div>
+                    <div style="flex: 1;">
+                      <label>Top P</label>
+                      <input type="number" id="topPInput" value="0.95" step="0.05" min="0" max="1">
                     </div>
                   </div>
                 </details>
@@ -749,6 +781,7 @@ jobs:
             const systemPromptInput = document.getElementById('systemPrompt');
             const tempInput = document.getElementById('tempInput');
             const maxTokensInput = document.getElementById('maxTokensInput');
+            const topPInput = document.getElementById('topPInput');
             let history = [];
 
             function appendMessage(role, text) {
@@ -775,7 +808,8 @@ jobs:
               let sysPrompt = systemPromptInput.value.trim();
               let messagesToSend = sysPrompt ? [{ role: 'system', content: sysPrompt }, ...history] : history;
               let temp = parseFloat(tempInput.value) || 0.7;
-              let maxTokens = parseInt(maxTokensInput.value) || 2048;
+              let maxTokens = parseInt(maxTokensInput.value) || 1024;
+              let topP = parseFloat(topPInput.value) || 0.95;
 
               try {
                 const res = await fetch('/v1/chat/completions', {
@@ -786,7 +820,8 @@ jobs:
                     messages: messagesToSend,
                     stream: true,
                     temperature: temp,
-                    max_tokens: maxTokens
+                    max_tokens: maxTokens,
+                    top_p: topP
                   })
                 });
 
@@ -1047,10 +1082,17 @@ jobs:
               if (data.files.length === 0) { btn.innerText = 'No GGUF'; return; }
               
               const selectId = 'select_' + repoId.replace(/[^a-zA-Z0-9]/g, '_');
-              let options = data.files.map(f => `<option value="${f}">${f}</option>`).join('');
+              let options = data.files.map(f => {
+                  let label = f;
+                  if (f.includes('IQ4_XS') || f.includes('Q4_K_M')) {
+                      label += ' ⚡ (Fastest)';
+                  }
+                  return `<option value="${f}">${label}</option>`;
+              }).join('');
+              
               btn.parentElement.innerHTML = `
                 <div class="row">
-                  <select id="${selectId}" style="padding: 0.4rem; max-width: 200px; font-size: 0.8rem; margin: 0;">${options}</select>
+                  <select id="${selectId}" style="padding: 0.4rem; max-width: 250px; font-size: 0.8rem; margin: 0;">${options}</select>
                   <button onclick="downloadSelected('${repoId}', '${selectId}')">Download</button>
                 </div>
               `;
@@ -1058,7 +1100,7 @@ jobs:
 
             async function downloadSelected(repoId, selectId) {
               const filename = document.getElementById(selectId).value;
-              showLoading(`Downloading ${filename}...<br><small>Maxing out connection speed. This may take a minute.</small>`);
+              showLoading(`Downloading ${filename}...<br><small>Maxing out connection speed with HF Xet. This may take a minute.</small>`);
               const res = await fetch('/api/download-model', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ repo_id: repoId, filename: filename })
