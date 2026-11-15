@@ -1,4 +1,4 @@
-name: Ultimate AI Suite (Max Speed Optimized)
+name: Ultimate AI Suite (Max Speed & Stability Optimized)
 
 on:
   workflow_dispatch:
@@ -44,11 +44,9 @@ jobs:
           cat > proxy/main.py << 'PYEOF'
           import os
           # --- PERFORMANCE OPTIMIZATIONS ---
-          # Enable HF Xet for maximum download speed
           os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
-          os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1" # Fallback
+          os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
           
-          # Prevent OpenMP and BLAS from over-subscribing threads
           cpu_count = os.cpu_count() or 4
           physical_cores = max(1, cpu_count // 2) if cpu_count > 2 else cpu_count
           os.environ["OMP_NUM_THREADS"] = str(cpu_count)
@@ -159,7 +157,6 @@ jobs:
                           try: chat_handler = MTMDChatHandler()
                           except: pass
                           
-                      # OPTIMIZATION: Use physical cores for generation, all logical cores for batch
                       print(f"[perf] CPU: {cpu_count} logical, {physical_cores} physical")
                       print(f"[perf] Threads -> Gen: {physical_cores}, Batch: {cpu_count}")
                       
@@ -167,13 +164,13 @@ jobs:
                           llm = Llama(
                               model_path=model_path, 
                               n_ctx=4096, 
-                              n_threads=physical_cores, # Prevent context switching overhead
-                              n_threads_batch=cpu_count, # Max out prompt processing
-                              n_batch=512,               # Swallow large prompts instantly
+                              n_threads=physical_cores,
+                              n_threads_batch=cpu_count,
+                              n_batch=512,
                               n_gpu_layers=0, 
-                              use_mlock=True,            # Lock in RAM
-                              use_mmap=True,             # Memory map
-                              flash_attn=True,           # Faster attention
+                              use_mlock=True,
+                              use_mmap=True,
+                              flash_attn=True,
                               verbose=False,
                               chat_handler=chat_handler
                           )
@@ -260,37 +257,46 @@ jobs:
                   completion_tokens = 0
                   yield ": keep-alive\n\n" 
 
-                  while True:
-                      if await request.is_disconnected():
-                          stop_event.set()
-                          break
+                  try:
+                      while True:
+                          if await request.is_disconnected():
+                              stop_event.set()
+                              break
 
-                      try:
-                          chunk = await asyncio.wait_for(asyncio.to_thread(q.get), timeout=15.0)
-                      except asyncio.TimeoutError:
-                          yield ": keep-alive\n\n"
-                          continue
+                          try:
+                              chunk = await asyncio.wait_for(asyncio.to_thread(q.get), timeout=15.0)
+                          except asyncio.TimeoutError:
+                              yield ": keep-alive\n\n"
+                              continue
 
-                      if chunk is None:
-                          break
+                          if chunk is None:
+                              break
 
-                      if "error" in chunk:
-                          yield f"data: {json.dumps({'error': chunk['error']})}\n\n"
-                          break
+                          if "error" in chunk:
+                              yield f"data: {json.dumps({'error': chunk['error']})}\n\n"
+                              break
+                              
+                          if isinstance(chunk, dict):
+                              chunk["model"] = model_name
+                              if chunk.get("choices"):
+                                  delta = chunk["choices"][0].get("delta", {})
+                                  if delta.get("content") or delta.get("tool_calls"):
+                                      completion_tokens += 1
                           
-                      if isinstance(chunk, dict):
-                          chunk["model"] = model_name
-                          if chunk.get("choices"):
-                              delta = chunk["choices"][0].get("delta", {})
-                              if delta.get("content") or delta.get("tool_calls"):
-                                  completion_tokens += 1
+                          yield f"data: {json.dumps(chunk)}\n\n"
+                          await asyncio.sleep(0.01)
                       
-                      yield f"data: {json.dumps(chunk)}\n\n"
-                      await asyncio.sleep(0.01)
+                      yield "data: [DONE]\n\n"
+                      if not await request.is_disconnected():
+                          await asyncio.to_thread(increment_usage, key_id, completion_tokens)
                   
-                  yield "data: [DONE]\n\n"
-                  if not await request.is_disconnected():
-                      await asyncio.to_thread(increment_usage, key_id, completion_tokens)
+                  except asyncio.CancelledError:
+                      # CRITICAL FIX: Catch client disconnects instantly to save the host
+                      print("[stream] Client disconnected abruptly. Stopping generation.", flush=True)
+                      stop_event.set()
+                      raise
+                  finally:
+                      stop_event.set()
 
               async def generate_async(self, model_name: str, messages, **kwargs):
                   return await asyncio.to_thread(self.generate_sync, model_name, messages, **kwargs)
@@ -499,31 +505,6 @@ jobs:
               except Exception as e: 
                   return JSONResponse(status_code=500, content={"error": str(e)})
 
-          @app.post("/v1/completions")
-          async def legacy_completions(request: Request, user: dict = Depends(require_api_user)):
-              body = await request.json()
-              model_name = body.pop("model", "auto")
-              prompt = body.pop("prompt", "")
-              messages = [{"role": "user", "content": prompt}]
-              try:
-                  res = await manager.generate_async(model_name, messages, **body)
-                  await asyncio.to_thread(increment_usage, user["id"], res.get("usage", {}).get("completion_tokens", 0))
-                  return JSONResponse(content={
-                      "id": f"cmpl-{uuid.uuid4()}",
-                      "object": "text_completion",
-                      "created": int(time.time()),
-                      "model": model_name,
-                      "choices": [{
-                          "text": res["choices"][0]["message"]["content"],
-                          "index": 0,
-                          "logprobs": None,
-                          "finish_reason": res["choices"][0].get("finish_reason", "stop")
-                      }],
-                      "usage": res.get("usage", {})
-                  })
-              except Exception as e: 
-                  return JSONResponse(status_code=500, content={"error": str(e)})
-
           @app.get("/health")
           async def health():
               return {"status": "ok", "loaded_models": list(manager.models.keys())}
@@ -551,13 +532,13 @@ jobs:
               input, select, textarea { width: 100%; padding: 0.7rem 1rem; background: rgba(15, 23, 42, 0.8); border: 1px solid var(--border); border-radius: 8px; color: white; margin-bottom: 1rem; font-family: inherit; }
               button { padding: 0.7rem 1.5rem; background: var(--primary); color: white; border: none; border-radius: 8px; cursor: pointer; }
               button:hover { opacity: 0.9; }
+              button:disabled { opacity: 0.5; cursor: not-allowed; }
               .btn-secondary { background: #334155; } .btn-danger { background: var(--error); }
               .btn { display: inline-block; padding: 0.5rem 1rem; border-radius: 8px; text-decoration: none; color: white; }
               .row { display: flex; gap: 0.75rem; align-items: center; }
               .input-group { display: flex; gap: 0.5rem; }
               .badge { padding: 0.25rem 0.5rem; border-radius: 999px; font-size: 0.75rem; font-weight: 600; }
               .badge.loaded { background: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.3); }
-              .badge.speed { background: rgba(59, 130, 246, 0.15); color: var(--primary); border: 1px solid rgba(59, 130, 246, 0.3); }
               .muted { color: #94a3b8; font-size: 0.9rem; }
               .nav-link { color: #94a3b8; text-decoration: none; font-size: 0.875rem; padding: 0.5rem 1rem; border-radius: 8px; }
               .nav-link:hover { background: rgba(148, 163, 184, 0.1); color: white; }
@@ -742,10 +723,18 @@ jobs:
                   
                   <div style="margin-top: 0.5rem;">
                     <label>System Prompt</label>
-                    <textarea id="systemPrompt" rows="2">You are a helpful assistant. Answer directly without showing your thinking process.</textarea>
+                    <textarea id="systemPrompt" rows="2">You are a helpful assistant.</textarea>
                   </div>
                   
-                  <div class="row">
+                  <div class="row" style="margin-bottom: 1rem;">
+                    <div style="flex: 1;">
+                      <label>Think Effort</label>
+                      <select id="thinkEffort">
+                        <option value="none">None (Direct)</option>
+                        <option value="auto" selected>Auto (Model Default)</option>
+                        <option value="high">High (Deep Reasoning)</option>
+                      </select>
+                    </div>
                     <div style="flex: 1;">
                       <label>Temperature</label>
                       <input type="number" id="tempInput" value="0.7" step="0.1" min="0" max="2">
@@ -753,10 +742,6 @@ jobs:
                     <div style="flex: 1;">
                       <label>Max Tokens</label>
                       <input type="number" id="maxTokensInput" value="1024" step="128" min="1">
-                    </div>
-                    <div style="flex: 1;">
-                      <label>Top P</label>
-                      <input type="number" id="topPInput" value="0.95" step="0.05" min="0" max="1">
                     </div>
                   </div>
                 </details>
@@ -768,7 +753,8 @@ jobs:
 
               <form id="chatForm" class="row">
                 <input type="text" id="chatInput" placeholder="Type a message..." style="flex: 1; margin: 0;" required {% if not loaded_models %}disabled{% endif %}>
-                <button type="submit" {% if not loaded_models %}disabled{% endif %}>Send</button>
+                <button type="submit" id="sendBtn" {% if not loaded_models %}disabled{% endif %}>Send</button>
+                <button type="button" id="stopBtn" class="btn-danger" style="display: none;">Stop</button>
               </form>
             </div>
           </div>
@@ -779,10 +765,14 @@ jobs:
             const chatInput = document.getElementById('chatInput');
             const modelSelect = document.getElementById('modelSelect');
             const systemPromptInput = document.getElementById('systemPrompt');
+            const thinkEffortInput = document.getElementById('thinkEffort');
             const tempInput = document.getElementById('tempInput');
             const maxTokensInput = document.getElementById('maxTokensInput');
-            const topPInput = document.getElementById('topPInput');
+            const sendBtn = document.getElementById('sendBtn');
+            const stopBtn = document.getElementById('stopBtn');
+            
             let history = [];
+            let abortController = null;
 
             function appendMessage(role, text) {
               const div = document.createElement('div');
@@ -796,6 +786,12 @@ jobs:
               return div;
             }
 
+            stopBtn.addEventListener('click', () => {
+              if (abortController) {
+                abortController.abort();
+              }
+            });
+
             chatForm.addEventListener('submit', async (e) => {
               e.preventDefault();
               const text = chatInput.value;
@@ -806,10 +802,20 @@ jobs:
               const aiDiv = appendMessage('assistant', '...');
               
               let sysPrompt = systemPromptInput.value.trim();
+              let effort = thinkEffortInput.value;
+              
+              if (effort === 'none') sysPrompt = "Answer directly and concisely. Do not output any internal thinking process or use  tags. " + sysPrompt;
+              else if (effort === 'high') sysPrompt = "Think deeply about this problem before answering. Wrap your internal monologue in  and  tags. " + sysPrompt;
+
               let messagesToSend = sysPrompt ? [{ role: 'system', content: sysPrompt }, ...history] : history;
               let temp = parseFloat(tempInput.value) || 0.7;
               let maxTokens = parseInt(maxTokensInput.value) || 1024;
-              let topP = parseFloat(topPInput.value) || 0.95;
+
+              abortController = new AbortController();
+              const signal = abortController.signal;
+
+              sendBtn.disabled = true;
+              stopBtn.style.display = 'inline-block';
 
               try {
                 const res = await fetch('/v1/chat/completions', {
@@ -820,9 +826,9 @@ jobs:
                     messages: messagesToSend,
                     stream: true,
                     temperature: temp,
-                    max_tokens: maxTokens,
-                    top_p: topP
-                  })
+                    max_tokens: maxTokens
+                  }),
+                  signal: signal
                 });
 
                 const reader = res.body.getReader();
@@ -871,7 +877,15 @@ jobs:
                 }
                 history.push({ role: 'assistant', content: aiText });
               } catch (err) {
-                aiDiv.innerHTML = `<strong>AI:</strong> <span style="color: var(--error)">Error: ${err.message}</span>`;
+                if (err.name === 'AbortError') {
+                  aiDiv.innerHTML += ` <span style="color: var(--error); font-size: 0.85rem;">(Stopped by user)</span>`;
+                } else {
+                  aiDiv.innerHTML = `<strong>AI:</strong> <span style="color: var(--error)">Error: ${err.message}</span>`;
+                }
+              } finally {
+                sendBtn.disabled = false;
+                stopBtn.style.display = 'none';
+                abortController = null;
               }
             });
           </script>
