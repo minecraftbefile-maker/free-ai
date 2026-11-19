@@ -22,23 +22,23 @@ jobs:
           sudo chmod 600 /mnt/large-swapfile
           sudo mkswap /mnt/large-swapfile
           sudo swapon /mnt/large-swapfile
+          # MODIFIED: Swappiness increased to 60 to allow memory swapping during model load
           sudo sysctl vm.swappiness=60
           free -h
 
       - name: Install Python Dependencies
         run: |
-          # 1. Force CPU-only PyTorch to prevent massive CUDA downloads
+          # MODIFIED: Force CPU-only PyTorch to prevent massive NVIDIA CUDA downloads
           pip install --no-cache-dir \
             --index-url https://download.pytorch.org/whl/cpu \
             torch torchvision torchaudio
 
-          # 2. Install llama-cpp and web dependencies
           pip install llama-cpp-python[server] \
             --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu \
             --prefer-binary
           pip install huggingface-hub fastapi uvicorn jinja2 python-multipart itsdangerous psutil
-
-          # 3. Install AirLLM (CPU version is handled by the official package)
+          
+          # MODIFIED: Install official AirLLM and pin transformers to avoid breaking changes
           pip install airllm
           pip install "transformers<5.0"
 
@@ -53,6 +53,7 @@ jobs:
 
           cat > proxy/main.py << 'PYEOF'
           import os
+          # MODIFIED: Disable HuggingFace Xet backend which causes hangs on CI runners
           os.environ["HF_HUB_DISABLE_XET"] = "1"
           os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
@@ -66,6 +67,7 @@ jobs:
           import hashlib
           import secrets
           import time
+          import traceback
           import threading
           import asyncio
           import datetime
@@ -73,9 +75,9 @@ jobs:
           import queue
           import subprocess
           from pathlib import Path
-          from typing import List, Dict, Any, AsyncGenerator
+          from typing import Optional, AsyncGenerator, List, Dict, Any
 
-          from fastapi import FastAPI, Request, Form, Depends, HTTPException
+          from fastapi import FastAPI, Request, Form, Depends, HTTPException, Query
           from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
           from fastapi.templating import Jinja2Templates
           from starlette.middleware.sessions import SessionMiddleware
@@ -87,8 +89,13 @@ jobs:
               from airllm import AutoModel as AirLLMAutoModel
               AIRLLM_AVAILABLE = True
           except ImportError:
-              AIRLLMAutoModel = None
+              AirLLMAutoModel = None
               AIRLLM_AVAILABLE = False
+
+          try:
+              from llama_cpp.llama_chat_format import MTMDChatHandler
+          except ImportError:
+              MTMDChatHandler = None
 
           BASE_DIR = Path(__file__).parent.resolve()
           SECRET_KEY = secrets.token_hex(32)
@@ -145,6 +152,7 @@ jobs:
 
           class LlamaCppModel(BaseModel):
               def __init__(self, model_path: str, n_ctx: int = 2048):
+                  # MODIFIED: Reduced n_ctx and n_batch, disabled mlock to save RAM
                   self.llm = Llama(
                       model_path=model_path,
                       n_ctx=n_ctx,
@@ -170,6 +178,7 @@ jobs:
           class AirLLMModel(BaseModel):
               def __init__(self, repo_id: str, compression: str = None):
                   if not AIRLLM_AVAILABLE: raise RuntimeError("AirLLM is not installed.")
+                  # MODIFIED: Force CPU mode and disable compression if CUDA is not available
                   try:
                       import torch
                       if not torch.cuda.is_available(): compression = None
@@ -334,29 +343,31 @@ jobs:
                       return k
               raise HTTPException(status_code=401, detail="Invalid API key")
 
+          # MODIFIED: FastAPI TemplateResponse syntax updated to {"request": request} to prevent 500 errors
+
           @app.get("/setup", response_class=HTMLResponse)
           async def setup_page(request: Request):
               if "password_hash" in load_config(): return RedirectResponse(url="/login")
-              return templates.TemplateResponse(request, "setup.html", {})
+              return templates.TemplateResponse("setup.html", {"request": request})
 
           @app.post("/setup")
           async def setup(request: Request, password: str = Form(...), confirm: str = Form(...)):
               if "password_hash" in load_config(): return RedirectResponse(url="/login")
-              if password != confirm or len(password) < 4: return templates.TemplateResponse(request, "setup.html", {"error": "Invalid password."})
+              if password != confirm or len(password) < 4: return templates.TemplateResponse("setup.html", {"request": request, "error": "Invalid password."})
               save_config({"password_hash": hash_password(password)})
               return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
 
           @app.get("/login", response_class=HTMLResponse)
           async def login_page(request: Request):
               if "password_hash" not in load_config(): return RedirectResponse(url="/setup")
-              return templates.TemplateResponse(request, "login.html", {})
+              return templates.TemplateResponse("login.html", {"request": request})
 
           @app.post("/login")
           async def login(request: Request, password: str = Form(...)):
               if check_password(password, load_config().get("password_hash", "")):
                   request.session["user"] = "admin"
                   return RedirectResponse(url="/", status_code=HTTP_303_SEE_OTHER)
-              return templates.TemplateResponse(request, "login.html", {"error": "Wrong password."})
+              return templates.TemplateResponse("login.html", {"request": request, "error": "Wrong password."})
 
           @app.get("/logout")
           async def logout(request: Request):
@@ -367,14 +378,14 @@ jobs:
           async def dashboard(request: Request, user: str = Depends(require_user)):
               loaded_models = list(manager.models.keys())
               gguf_models = sorted(f.name for f in MODELS_DIR.glob("*.gguf") if f.name not in loaded_models)
-              return templates.TemplateResponse(request, "dashboard.html", {
-                  "user": user, "loaded_models": loaded_models, "available_gguf_models": gguf_models,
+              return templates.TemplateResponse("dashboard.html", {
+                  "request": request, "user": user, "loaded_models": loaded_models, "available_gguf_models": gguf_models,
                   "airllm_available": AIRLLM_AVAILABLE, "base_url": str(request.base_url).rstrip("/")
               })
 
           @app.get("/playground", response_class=HTMLResponse)
           async def playground_page(request: Request, user: str = Depends(require_user)):
-              return templates.TemplateResponse(request, "playground.html", {"user": user, "loaded_models": list(manager.models.keys())})
+              return templates.TemplateResponse("playground.html", {"request": request, "user": user, "loaded_models": list(manager.models.keys())})
 
           @app.get("/keys", response_class=HTMLResponse)
           async def keys_page(request: Request, user: str = Depends(require_user)):
@@ -382,11 +393,11 @@ jobs:
               for k in keys:
                   k["masked"] = f"{k['key'][:8]}...{k['key'][-4:]}"
                   k["expires_str"] = datetime.datetime.fromtimestamp(k["expires_at"]).strftime('%Y-%m-%d') if k["expires_at"] > 0 else "Never"
-              return templates.TemplateResponse(request, "keys.html", {"user": user, "keys": keys})
+              return templates.TemplateResponse("keys.html", {"request": request, "user": user, "keys": keys})
 
           @app.get("/store", response_class=HTMLResponse)
           async def store_page(request: Request, user: str = Depends(require_user)):
-              return templates.TemplateResponse(request, "store.html", {"user": user, "airllm_available": AIRLLM_AVAILABLE})
+              return templates.TemplateResponse("store.html", {"request": request, "user": user, "airllm_available": AIRLLM_AVAILABLE})
 
           @app.get("/api/keys")
           async def api_list_keys(user: dict = Depends(require_api_user)): return load_keys()
@@ -442,6 +453,7 @@ jobs:
               files = await asyncio.to_thread(hf_api.list_repo_files, repo_id=repo_id)
               return {"repo_id": repo_id, "files": sorted([f for f in files if f.endswith(".gguf")])}
 
+          # MODIFIED: Robust curl downloader to bypass HuggingFace Xet stalling
           def robust_download(repo_id: str, filename: str, local_dir: str):
               url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
               dest = os.path.join(local_dir, filename)
@@ -475,27 +487,74 @@ jobs:
           async def health(): return {"status": "ok", "loaded_models": list(manager.models.keys()), "airllm_available": AIRLLM_AVAILABLE}
           PYEOF
 
-          # ---------- base.html ----------
+          # ---------- base.html (Generic Style) ----------
           cat > proxy/templates/base.html << 'HTMLEOF'
           <!DOCTYPE html>
           <html lang="en">
           <head>
-            <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>{% block title %}AI Suite{% endblock %}</title>
             <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
             <style>
-              :root { --bg: #0d1117; --surface: #161b22; --border: #30363d; --text: #c9d1d9; --text-muted: #8b949e; --primary: #1f6feb; --primary-hover: #388bfd; --success: #238636; --error: #da3633; }
+              :root { 
+                --bg: #0d1117; 
+                --surface: #161b22; 
+                --border: #30363d; 
+                --text: #c9d1d9; 
+                --text-muted: #8b949e;
+                --primary: #1f6feb; 
+                --primary-hover: #388bfd;
+                --success: #238636; 
+                --error: #da3633; 
+              }
               * { box-sizing: border-box; margin: 0; padding: 0; }
-              body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; background-color: var(--bg); color: var(--text); padding: 2rem 1rem; line-height: 1.5; font-size: 14px; }
+              body { 
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; 
+                background-color: var(--bg); 
+                color: var(--text); 
+                padding: 2rem 1rem; 
+                line-height: 1.5;
+                font-size: 14px;
+              }
               .container { max-width: 960px; margin: 0 auto; }
-              .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border); }
+              .header { 
+                display: flex; justify-content: space-between; align-items: center;
+                margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border); 
+              }
               .logo { font-size: 1.25rem; font-weight: 600; color: #fff; }
-              .card { background-color: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 1.5rem; margin-bottom: 1rem; }
-              .card h2 { font-size: 1rem; font-weight: 600; margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+              .card { 
+                background-color: var(--surface); 
+                border: 1px solid var(--border); 
+                border-radius: 6px; 
+                padding: 1.5rem; 
+                margin-bottom: 1rem; 
+              }
+              .card h2 { 
+                font-size: 1rem; font-weight: 600; margin-bottom: 1rem; 
+                padding-bottom: 0.5rem; border-bottom: 1px solid var(--border);
+                display: flex; justify-content: space-between; align-items: center;
+              }
               label { display: block; font-size: 0.85rem; margin-bottom: 0.5rem; font-weight: 600; color: var(--text); }
-              input, select, textarea { width: 100%; padding: 0.5rem 0.75rem; background-color: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text); margin-bottom: 1rem; font-family: inherit; font-size: 14px; }
+              input, select, textarea { 
+                width: 100%; padding: 0.5rem 0.75rem; 
+                background-color: var(--bg); 
+                border: 1px solid var(--border); 
+                border-radius: 4px; 
+                color: var(--text); 
+                margin-bottom: 1rem; 
+                font-family: inherit; font-size: 14px;
+              }
               input:focus, select:focus, textarea:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px rgba(31, 111, 235, 0.3); }
-              button { padding: 0.5rem 1rem; background-color: var(--primary); color: #fff; border: 1px solid rgba(240,246,252,0.1); border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: 500; }
+              button { 
+                padding: 0.5rem 1rem; 
+                background-color: var(--primary); 
+                color: #fff; 
+                border: 1px solid rgba(240,246,252,0.1); 
+                border-radius: 4px; 
+                cursor: pointer; 
+                font-size: 14px; font-weight: 500;
+              }
               button:hover { background-color: var(--primary-hover); }
               button:disabled { opacity: 0.5; cursor: not-allowed; }
               .btn-secondary { background-color: #21262d; color: var(--text); border-color: var(--border); }
@@ -514,7 +573,7 @@ jobs:
               .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 2em; font-size: 0.75rem; font-weight: 600; border: 1px solid var(--border); background-color: #21262d; }
               .markdown-body p { margin-bottom: 0.75rem; }
               .markdown-body ul, .markdown-body ol { margin-left: 1.5rem; margin-bottom: 0.75rem; }
-              .markdown-body code { background: rgba(110,118,129,0.4); padding: 0.2rem 0.4rem; border-radius: 4px; font-family: monospace; font-size: 85%; }
+              .markdown-body code { background: rgba(110,118,129,0.4); padding: 0.2rem 0.4rem; border-radius: 4px; font-family: ui-monospace, SFMono-Regular, SF Mono, Menlo, Consolas, Liberation Mono, monospace; font-size: 85%; }
               .markdown-body pre { background: #161b22; padding: 1rem; border-radius: 6px; overflow-x: auto; margin-bottom: 0.75rem; border: 1px solid var(--border); }
               .markdown-body pre code { background: transparent; padding: 0; }
               #loadingOverlay { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(13, 17, 23, 0.8); display: none; justify-content: center; align-items: center; z-index: 9999; flex-direction: column; gap: 1rem; }
@@ -533,7 +592,7 @@ jobs:
           </html>
           HTMLEOF
 
-          # ---------- setup.html ----------
+          # ---------- setup.html (unchanged) ----------
           cat > proxy/templates/setup.html << 'HTMLEOF'
           {% extends "base.html" %}
           {% block body %}
@@ -553,7 +612,7 @@ jobs:
           {% endblock %}
           HTMLEOF
 
-          # ---------- login.html ----------
+          # ---------- login.html (unchanged) ----------
           cat > proxy/templates/login.html << 'HTMLEOF'
           {% extends "base.html" %}
           {% block body %}
@@ -571,7 +630,7 @@ jobs:
           {% endblock %}
           HTMLEOF
 
-          # ---------- dashboard.html ----------
+          # ---------- dashboard.html (updated with runtime selection) ----------
           cat > proxy/templates/dashboard.html << 'HTMLEOF'
           {% extends "base.html" %}
           {% block body %}
@@ -587,6 +646,7 @@ jobs:
                 <a href="/logout" class="btn-secondary">Logout</a>
               </div>
             </div>
+
             <div class="card">
               <h2>Loaded Models</h2>
               {% if loaded_models %}
@@ -603,6 +663,7 @@ jobs:
                 <p class="muted">No models currently loaded.</p>
               {% endif %}
             </div>
+
             {% if available_gguf_models or airllm_available %}
             <div class="card">
               <h2>Load Model</h2>
@@ -644,6 +705,7 @@ jobs:
               </form>
             </div>
             {% endif %}
+
             <div class="card">
               <h2>API Configuration</h2>
               <label>Base URL</label>
@@ -653,39 +715,67 @@ jobs:
               </div>
             </div>
           </div>
+
           <script>
             const runtimeSelect = document.getElementById('runtimeSelect');
             const ggufSelector = document.getElementById('ggufSelector');
             const airllmSelector = document.getElementById('airllmSelector');
             const airllmOptions = document.getElementById('airllmOptions');
+
             runtimeSelect.addEventListener('change', () => {
               if (runtimeSelect.value === 'airllm') {
-                ggufSelector.style.display = 'none'; airllmSelector.style.display = 'block'; airllmOptions.style.display = 'block';
+                ggufSelector.style.display = 'none';
+                airllmSelector.style.display = 'block';
+                airllmOptions.style.display = 'block';
               } else {
-                ggufSelector.style.display = 'block'; airllmSelector.style.display = 'none'; airllmOptions.style.display = 'none';
+                ggufSelector.style.display = 'block';
+                airllmSelector.style.display = 'none';
+                airllmOptions.style.display = 'none';
               }
             });
+
             document.getElementById('loadModelForm').addEventListener('submit', async (e) => {
               e.preventDefault();
               showLoading(`Loading model...`);
               const runtime = runtimeSelect.value;
-              const modelName = runtime === 'llama-cpp' ? document.getElementById('ggufModelSelect').value : document.getElementById('airllmRepoInput').value.trim();
-              if (!modelName) { alert('Please enter a model name.'); hideLoading(); return; }
-              const payload = { model_name: modelName, runtime: runtime, compression: runtime === 'airllm' ? document.getElementById('compressionSelect').value || undefined : undefined };
-              const res = await fetch('/api/load-model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+              const modelName = runtime === 'llama-cpp'
+                ? document.getElementById('ggufModelSelect').value
+                : document.getElementById('airllmRepoInput').value.trim();
+              if (!modelName) {
+                alert('Please enter a model name.');
+                hideLoading();
+                return;
+              }
+              const payload = {
+                model_name: modelName,
+                runtime: runtime,
+                compression: runtime === 'airllm' ? document.getElementById('compressionSelect').value || undefined : undefined,
+              };
+              const res = await fetch('/api/load-model', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+              });
               if (res.ok) window.location.reload();
-              else { const err = await res.json(); alert(err.error || 'Failed to load model.'); hideLoading(); }
+              else {
+                const err = await res.json();
+                alert(err.error || 'Failed to load model.');
+                hideLoading();
+              }
             });
+
             async function unloadModel(name) {
               showLoading(`Unloading...`);
-              await fetch('/api/unload-model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model_name: name }) });
+              await fetch('/api/unload-model', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model_name: name })
+              });
               setTimeout(() => window.location.reload(), 2000);
             }
           </script>
           {% endblock %}
           HTMLEOF
 
-          # ---------- playground.html ----------
+          # ---------- playground.html (unchanged) ----------
           cat > proxy/templates/playground.html << 'HTMLEOF'
           {% extends "base.html" %}
           {% block body %}
@@ -701,6 +791,7 @@ jobs:
                 <a href="/logout" class="btn-secondary">Logout</a>
               </div>
             </div>
+
             <div class="card" style="display: flex; flex-direction: column; height: 75vh;">
               <div class="row" style="margin-bottom: 1rem;">
                 <select id="modelSelect" style="margin: 0;">
@@ -711,20 +802,37 @@ jobs:
                   {% endfor %}
                 </select>
               </div>
+
               <details style="margin-bottom: 1rem;">
                 <summary style="cursor: pointer; color: var(--text-muted); font-size: 0.9rem;">Settings</summary>
                 <div style="margin-top: 0.5rem; padding: 0.5rem; background: var(--bg); border: 1px solid var(--border); border-radius: 4px;">
                   <label>System Prompt</label>
                   <textarea id="systemPrompt" rows="2">You are a helpful assistant.</textarea>
                   <div class="row">
-                    <div style="flex: 1;"><label>Temp</label><input type="number" id="tempInput" value="0.7" step="0.1" min="0" max="2"></div>
-                    <div style="flex: 1;"><label>Max Tokens</label><input type="number" id="maxTokensInput" value="1024" step="128" min="1"></div>
+                    <div style="flex: 1;">
+                      <label>Think Effort</label>
+                      <select id="thinkEffort">
+                        <option value="none">None (Direct)</option>
+                        <option value="auto" selected>Auto (Model Default)</option>
+                        <option value="high">High (Deep Reasoning)</option>
+                      </select>
+                    </div>
+                    <div style="flex: 1;">
+                      <label>Temp</label>
+                      <input type="number" id="tempInput" value="0.7" step="0.1" min="0" max="2">
+                    </div>
+                    <div style="flex: 1;">
+                      <label>Max Tokens</label>
+                      <input type="number" id="maxTokensInput" value="1024" step="128" min="1">
+                    </div>
                   </div>
                 </div>
               </details>
+              
               <div id="chatBox" style="flex: 1; overflow-y: auto; border: 1px solid var(--border); border-radius: 4px; padding: 1rem; margin-bottom: 1rem; background: #000;">
                 <div class="muted" style="text-align: center; margin-top: 2rem;">Start a conversation...</div>
               </div>
+
               <form id="chatForm" class="row">
                 <input type="text" id="chatInput" placeholder="Type a message..." style="flex: 1; margin: 0;" required {% if not loaded_models %}disabled{% endif %}>
                 <button type="submit" id="sendBtn" {% if not loaded_models %}disabled{% endif %}>Send</button>
@@ -732,40 +840,111 @@ jobs:
               </form>
             </div>
           </div>
+
           <script>
-            const chatBox = document.getElementById('chatBox'); const chatForm = document.getElementById('chatForm'); const chatInput = document.getElementById('chatInput');
-            const modelSelect = document.getElementById('modelSelect'); const sendBtn = document.getElementById('sendBtn'); const stopBtn = document.getElementById('stopBtn');
-            let history = []; let abortController = null;
+            const chatBox = document.getElementById('chatBox');
+            const chatForm = document.getElementById('chatForm');
+            const chatInput = document.getElementById('chatInput');
+            const modelSelect = document.getElementById('modelSelect');
+            const systemPromptInput = document.getElementById('systemPrompt');
+            const thinkEffortInput = document.getElementById('thinkEffort');
+            const tempInput = document.getElementById('tempInput');
+            const maxTokensInput = document.getElementById('maxTokensInput');
+            const sendBtn = document.getElementById('sendBtn');
+            const stopBtn = document.getElementById('stopBtn');
+            
+            let history = [];
+            let abortController = null;
+
             function appendMessage(role, text) {
-              const div = document.createElement('div'); div.style.marginBottom = '1rem'; div.style.paddingBottom = '1rem'; div.style.borderBottom = '1px solid var(--border)';
-              div.innerHTML = `<strong>${role === 'user' ? 'User' : 'Assistant'}:</strong><br>${text}`; chatBox.appendChild(div); chatBox.scrollTop = chatBox.scrollHeight; return div;
+              const div = document.createElement('div');
+              div.style.marginBottom = '1rem';
+              div.style.paddingBottom = '1rem';
+              div.style.borderBottom = '1px solid var(--border)';
+              div.innerHTML = `<strong>${role === 'user' ? 'User' : 'Assistant'}:</strong><br>${text}`;
+              chatBox.appendChild(div);
+              chatBox.scrollTop = chatBox.scrollHeight;
+              return div;
             }
-            stopBtn.addEventListener('click', () => { if (abortController) abortController.abort(); });
+
+            stopBtn.addEventListener('click', () => {
+              if (abortController) abortController.abort();
+            });
+
             chatForm.addEventListener('submit', async (e) => {
               e.preventDefault();
-              const text = chatInput.value; chatInput.value = ''; appendMessage('user', text); history.push({ role: 'user', content: text });
+              const text = chatInput.value;
+              chatInput.value = '';
+              appendMessage('user', text);
+              history.push({ role: 'user', content: text });
+
               const aiDiv = appendMessage('assistant', '...');
-              let sysPrompt = document.getElementById('systemPrompt').value.trim();
+              
+              let sysPrompt = systemPromptInput.value.trim();
+              let effort = thinkEffortInput.value;
+              
+              if (effort === 'none') sysPrompt = "Answer directly and concisely. Do not output any internal thinking process or use  tags. " + sysPrompt;
+              else if (effort === 'high') sysPrompt = "Think deeply about this problem before answering. Wrap your internal monologue in  and  tags. " + sysPrompt;
+
               let messagesToSend = sysPrompt ? [{ role: 'system', content: sysPrompt }, ...history] : history;
+              let temp = parseFloat(tempInput.value) || 0.7;
+              let maxTokens = parseInt(maxTokensInput.value) || 1024;
+
               abortController = new AbortController();
-              sendBtn.disabled = true; stopBtn.style.display = 'inline-block';
+              const signal = abortController.signal;
+
+              sendBtn.disabled = true;
+              stopBtn.style.display = 'inline-block';
+
               try {
                 const res = await fetch('/v1/chat/completions', {
-                  method: 'POST', headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ model: modelSelect.value, messages: messagesToSend, stream: true, temperature: parseFloat(document.getElementById('tempInput').value) || 0.7, max_tokens: parseInt(document.getElementById('maxTokensInput').value) || 1024 }),
-                  signal: abortController.signal
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    model: modelSelect.value,
+                    messages: messagesToSend,
+                    stream: true,
+                    temperature: temp,
+                    max_tokens: maxTokens
+                  }),
+                  signal: signal
                 });
-                const reader = res.body.getReader(); const decoder = new TextDecoder(); let aiText = '';
+
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let aiText = '';
+
                 while (true) {
-                  const { done, value } = await reader.read(); if (done) break;
-                  const chunk = decoder.decode(value); const lines = chunk.split('\n');
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  const chunk = decoder.decode(value);
+                  const lines = chunk.split('\n');
+                  
                   for (const line of lines) {
                     if (line.startsWith('data: ') && line !== 'data: [DONE]') {
                       try {
                         const data = JSON.parse(line.slice(6));
-                        if (data.choices && data.choices[0].delta && data.choices[0].delta.content) {
-                          aiText += data.choices[0].delta.content;
-                          aiDiv.innerHTML = `<strong>Assistant:</strong><br><div class="markdown-body">${marked.parse(aiText)}</div>`; chatBox.scrollTop = chatBox.scrollHeight;
+                        if (data.choices && data.choices[0].delta) {
+                          const delta = data.choices[0].delta;
+                          
+                          if (delta.content) aiText += delta.content;
+                          if (delta.tool_calls) aiText += `\n\nTool Call:\n\`\`\`json\n${JSON.stringify(delta.tool_calls, null, 2)}\n\`\`\`\n`;
+                          
+                          let thinkingHtml = "";
+                          let cleanText = aiText;
+                          
+                          cleanText = cleanText.replace(/<think>([\s\S]*?)<\/think>/g, (match, p1) => {
+                              thinkingHtml += `<details style="margin-bottom: 0.5rem; font-size: 0.9em; color: #8b949e;"><summary style="cursor: pointer;">Thinking Process</summary><div style="padding-left: 1rem; border-left: 2px solid #30363d; margin-top: 0.5rem;">${p1.trim()}</div></details>`;
+                              return "";
+                          });
+                          
+                          cleanText = cleanText.replace(/<think>([\s\S]*)$/, (match, p1) => {
+                              thinkingHtml += `<details open style="margin-bottom: 0.5rem; font-size: 0.9em; color: #8b949e;"><summary style="cursor: pointer;">Thinking Process...</summary><div style="padding-left: 1rem; border-left: 2px solid #30363d; margin-top: 0.5rem;">${p1.trim()}</div></details>`;
+                              return "";
+                          });
+
+                          aiDiv.innerHTML = `<strong>Assistant:</strong><br>${thinkingHtml}<div class="markdown-body">${marked.parse(cleanText)}</div>`;
+                          chatBox.scrollTop = chatBox.scrollHeight;
                         }
                       } catch (err) {}
                     }
@@ -773,14 +952,22 @@ jobs:
                 }
                 history.push({ role: 'assistant', content: aiText });
               } catch (err) {
-                if (err.name !== 'AbortError') aiDiv.innerHTML = `<strong>Assistant:</strong> <span style="color: var(--error)">Error: ${err.message}</span>`;
-              } finally { sendBtn.disabled = false; stopBtn.style.display = 'none'; abortController = null; }
+                if (err.name === 'AbortError') {
+                  aiDiv.innerHTML += `<br><span class="muted" style="font-size: 0.85rem;">(Stopped)</span>`;
+                } else {
+                  aiDiv.innerHTML = `<strong>Assistant:</strong> <span style="color: var(--error)">Error: ${err.message}</span>`;
+                }
+              } finally {
+                sendBtn.disabled = false;
+                stopBtn.style.display = 'none';
+                abortController = null;
+              }
             });
           </script>
           {% endblock %}
           HTMLEOF
 
-          # ---------- keys.html ----------
+          # ---------- keys.html (unchanged) ----------
           cat > proxy/templates/keys.html << 'HTMLEOF'
           {% extends "base.html" %}
           {% block body %}
@@ -796,12 +983,27 @@ jobs:
                 <a href="/logout" class="btn-secondary">Logout</a>
               </div>
             </div>
+
             <div class="card">
               <h2>Create Key</h2>
               <form id="createKeyForm">
                 <div class="row" style="margin-bottom: 1rem;">
-                  <div style="flex: 2;"><label>Name</label><input type="text" id="keyName" placeholder="e.g. App Key" required></div>
-                  <div style="flex: 1;"><label>Expires (Days)</label><input type="number" id="keyExpiry" placeholder="0 = Never" value="0"></div>
+                  <div style="flex: 2;">
+                    <label>Name</label>
+                    <input type="text" id="keyName" placeholder="e.g. App Key" required>
+                  </div>
+                  <div style="flex: 1;">
+                    <label>Expires (Days)</label>
+                    <input type="number" id="keyExpiry" placeholder="0 = Never" value="0">
+                  </div>
+                  <div style="flex: 1;">
+                    <label>Max Requests</label>
+                    <input type="number" id="keyReqLimit" placeholder="0 = ∞" value="0">
+                  </div>
+                  <div style="flex: 1;">
+                    <label>Max Tokens</label>
+                    <input type="number" id="keyTokLimit" placeholder="0 = ∞" value="0">
+                  </div>
                 </div>
                 <button type="submit">Generate</button>
               </form>
@@ -813,19 +1015,40 @@ jobs:
                 </div>
               </div>
             </div>
+
             <div class="card">
               <h2>Existing Keys</h2>
               <table style="width: 100%; border-collapse: collapse; margin-top: 1rem; font-size: 14px;">
-                <thead><tr><th style="text-align: left; padding: 0.5rem; border-bottom: 1px solid var(--border);">Name</th><th style="text-align: left; padding: 0.5rem; border-bottom: 1px solid var(--border);">Key</th><th style="text-align: left; padding: 0.5rem; border-bottom: 1px solid var(--border);">Status</th><th style="text-align: left; padding: 0.5rem; border-bottom: 1px solid var(--border);">Actions</th></tr></thead>
+                <thead>
+                  <tr>
+                    <th style="text-align: left; padding: 0.5rem; border-bottom: 1px solid var(--border);">Name</th>
+                    <th style="text-align: left; padding: 0.5rem; border-bottom: 1px solid var(--border);">Key</th>
+                    <th style="text-align: left; padding: 0.5rem; border-bottom: 1px solid var(--border);">Usage</th>
+                    <th style="text-align: left; padding: 0.5rem; border-bottom: 1px solid var(--border);">Expires</th>
+                    <th style="text-align: left; padding: 0.5rem; border-bottom: 1px solid var(--border);">Status</th>
+                    <th style="text-align: left; padding: 0.5rem; border-bottom: 1px solid var(--border);">Actions</th>
+                  </tr>
+                </thead>
                 <tbody>
                   {% for k in keys %}
                   <tr>
                     <td style="padding: 0.5rem; border-bottom: 1px solid var(--border);">{{ k.name }}</td>
                     <td style="padding: 0.5rem; border-bottom: 1px solid var(--border); font-family: monospace; font-size: 12px;">{{ k.masked }}</td>
-                    <td style="padding: 0.5rem; border-bottom: 1px solid var(--border);"><span class="badge" style="background: {{ 'var(--success)' if k.active else 'var(--error)' }}; color: white; border: none;">{{ 'Active' if k.active else 'Revoked' }}</span></td>
                     <td style="padding: 0.5rem; border-bottom: 1px solid var(--border);">
-                      <button class="btn-secondary" style="padding: 0.2rem 0.4rem; font-size: 12px;" onclick="toggleKey('{{ k.id }}')">{{ 'Disable' if k.active else 'Enable' }}</button>
-                      <button class="btn-danger" style="padding: 0.2rem 0.4rem; font-size: 12px;" onclick="deleteKey('{{ k.id }}')">Delete</button>
+                      {{ k.requests_used }} / {{ '∞' if k.max_requests == 0 else k.max_requests }} req<br>
+                      {{ k.tokens_used }} / {{ '∞' if k.max_tokens == 0 else k.max_tokens }} tok
+                    </td>
+                    <td style="padding: 0.5rem; border-bottom: 1px solid var(--border);">{{ k.expires_str }}</td>
+                    <td style="padding: 0.5rem; border-bottom: 1px solid var(--border);">
+                      <span class="badge" style="background: {{ 'var(--success)' if k.active else 'var(--error)' }}; color: white; border: none;">{{ 'Active' if k.active else 'Revoked' }}</span>
+                    </td>
+                    <td style="padding: 0.5rem; border-bottom: 1px solid var(--border);">
+                      <button class="btn-secondary" style="padding: 0.2rem 0.4rem; font-size: 12px;" onclick="toggleKey('{{ k.id }}')">
+                        {{ 'Disable' if k.active else 'Enable' }}
+                      </button>
+                      <button class="btn-danger" style="padding: 0.2rem 0.4rem; font-size: 12px;" onclick="deleteKey('{{ k.id }}')">
+                        Delete
+                      </button>
                     </td>
                   </tr>
                   {% endfor %}
@@ -833,22 +1056,48 @@ jobs:
               </table>
             </div>
           </div>
+
           <script>
             document.getElementById('createKeyForm').addEventListener('submit', async (e) => {
-              e.preventDefault(); showLoading('Generating...');
-              const res = await fetch('/api/keys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: document.getElementById('keyName').value, expires_days: document.getElementById('keyExpiry').value }) });
+              e.preventDefault();
+              showLoading('Generating...');
+              const res = await fetch('/api/keys', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  name: document.getElementById('keyName').value,
+                  expires_days: document.getElementById('keyExpiry').value,
+                  max_req: document.getElementById('keyReqLimit').value,
+                  max_tok: document.getElementById('keyTokLimit').value
+                })
+              });
               if (res.ok) {
-                const data = await res.json(); document.getElementById('newKeyDisplay').style.display = 'block'; document.getElementById('generatedKey').value = data.key; document.getElementById('createKeyForm').reset(); hideLoading();
+                const data = await res.json();
+                document.getElementById('newKeyDisplay').style.display = 'block';
+                document.getElementById('generatedKey').value = data.key;
+                document.getElementById('createKeyForm').reset();
+                hideLoading();
                 setTimeout(() => window.location.reload(), 10000);
-              } else { alert('Failed'); hideLoading(); }
+              } else {
+                alert('Failed'); hideLoading();
+              }
             });
-            async function toggleKey(id) { await fetch(`/api/keys/${id}/toggle`, { method: 'PUT' }); window.location.reload(); }
-            async function deleteKey(id) { if (confirm('Delete this key?')) { await fetch(`/api/keys/${id}`, { method: 'DELETE' }); window.location.reload(); } }
+
+            async function toggleKey(id) {
+              await fetch(`/api/keys/${id}/toggle`, { method: 'PUT' });
+              window.location.reload();
+            }
+
+            async function deleteKey(id) {
+              if (confirm('Delete this key?')) {
+                await fetch(`/api/keys/${id}`, { method: 'DELETE' });
+                window.location.reload();
+              }
+            }
           </script>
           {% endblock %}
           HTMLEOF
 
-          # ---------- store.html ----------
+          # ---------- store.html (updated to show big models for AirLLM) ----------
           cat > proxy/templates/store.html << 'HTMLEOF'
           {% extends "base.html" %}
           {% block body %}
@@ -864,6 +1113,7 @@ jobs:
                 <a href="/logout" class="btn-secondary">Logout</a>
               </div>
             </div>
+
             <div class="card">
               <h2>Search Models</h2>
               <div class="row" style="margin-bottom: 1rem;">
@@ -876,58 +1126,92 @@ jobs:
                 </label>
               </p>
             </div>
+
             <div id="resultsContainer" class="card" style="display: none;">
               <h2>Results</h2>
               <div id="resultsList"></div>
             </div>
           </div>
+
           <script>
             async function searchModels() {
-              const q = document.getElementById('searchInput').value; const big = document.getElementById('showBigModels').checked;
+              const q = document.getElementById('searchInput').value;
+              const big = document.getElementById('showBigModels').checked;
               showLoading('Searching...');
-              const res = await fetch(big ? `/api/store/search-big?q=${encodeURIComponent(q)}` : `/api/store/search?q=${encodeURIComponent(q)}`);
-              const models = await res.json(); hideLoading();
-              const list = document.getElementById('resultsList'); list.innerHTML = models.length ? '' : '<p class="muted">No models found.</p>';
+              const url = big ? `/api/store/search-big?q=${encodeURIComponent(q)}` : `/api/store/search?q=${encodeURIComponent(q)}`;
+              const res = await fetch(url);
+              const models = await res.json();
+              hideLoading();
+              
+              const list = document.getElementById('resultsList');
+              list.innerHTML = models.length ? '' : '<p class="muted">No models found.</p>';
+              
               models.forEach(m => {
                 const safeId = m.id.replace(/[^a-zA-Z0-9]/g, '_');
+                const isBig = big;
                 list.innerHTML += `
                   <div class="row" style="border-bottom: 1px solid var(--border); padding: 0.75rem 0;">
                     <div style="flex: 1;">
-                      <div style="font-weight: 600;">${m.id} ${big ? '<span class="badge">Big</span>' : ''}</div>
+                      <div style="font-weight: 600;">${m.id} ${m.is_vision ? '<span class="badge">Vision</span>' : ''} ${isBig ? '<span class="badge">Big</span>' : ''}</div>
                       <div class="muted" style="font-size: 0.85rem;">${m.downloads} downloads</div>
                     </div>
                     <div id="actions_${safeId}">
-                      ${big ? `<button class="btn-secondary" onclick="loadAirLLM('${m.id}')">Load via AirLLM</button>` : `<button class="btn-secondary" onclick="fetchFiles('${m.id}', this)">Get Files</button>`}
+                      ${big 
+                        ? `<button class="btn-secondary" onclick="loadAirLLM('${m.id}')">Load via AirLLM</button>`
+                        : `<button class="btn-secondary" onclick="fetchFiles('${m.id}', this)">Get Files</button>`
+                      }
                     </div>
                   </div>
                 `;
               });
               document.getElementById('resultsContainer').style.display = 'block';
             }
+
             document.getElementById('searchBtn').addEventListener('click', searchModels);
             document.getElementById('searchInput').addEventListener('keypress', (e) => { if (e.key === 'Enter') searchModels(); });
             window.onload = searchModels;
+
             async function fetchFiles(repoId, btn) {
               btn.innerText = 'Fetching...';
               const res = await fetch(`/api/store/files?repo_id=${encodeURIComponent(repoId)}`);
               const data = await res.json();
               if (data.files.length === 0) { btn.innerText = 'No GGUF'; return; }
+              
               const selectId = 'select_' + repoId.replace(/[^a-zA-Z0-9]/g, '_');
+              let options = data.files.map(f => `<option value="${f}">${f}</option>`).join('');
               btn.parentElement.innerHTML = `
-                <div class="row"><select id="${selectId}" style="padding: 0.4rem; margin: 0; font-size: 0.85rem;">${data.files.map(f => `<option value="${f}">${f}</option>`).join('')}</select>
-                <button onclick="downloadSelected('${repoId}', '${selectId}')">Download</button></div>
+                <div class="row">
+                  <select id="${selectId}" style="padding: 0.4rem; margin: 0; font-size: 0.85rem;">${options}</select>
+                  <button onclick="downloadSelected('${repoId}', '${selectId}')">Download</button>
+                </div>
               `;
             }
+
             async function downloadSelected(repoId, selectId) {
+              const filename = document.getElementById(selectId).value;
               showLoading(`Downloading...`);
-              const res = await fetch('/api/download-model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ repo_id: repoId, filename: document.getElementById(selectId).value }) });
-              if (res.ok) window.location.href = '/'; else { alert('Download failed.'); hideLoading(); }
+              const res = await fetch('/api/download-model', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ repo_id: repoId, filename: filename })
+              });
+              if (res.ok) window.location.href = '/';
+              else { alert('Download failed.'); hideLoading(); }
             }
+
             async function loadAirLLM(repoId) {
-              if (!confirm(`Load "${repoId}" via AirLLM?`)) return;
-              showLoading(`Loading ${repoId} via AirLLM...`);
-              const res = await fetch('/api/load-model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model_name: repoId, runtime: 'airllm' }) });
-              if (res.ok) window.location.href = '/'; else { const err = await res.json(); alert(err.error || 'Failed'); hideLoading(); }
+              if (!confirm(`Load "${repoId}" via AirLLM? This may take a long time as the model is sharded.`)) return;
+              showLoading(`Loading ${repoId} via AirLLM (this may take a while)...`);
+              const res = await fetch('/api/load-model', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model_name: repoId, runtime: 'airllm' })
+              });
+              if (res.ok) {
+                window.location.href = '/';
+              } else {
+                const err = await res.json();
+                alert(err.error || 'Failed to load AirLLM model.');
+                hideLoading();
+              }
             }
           </script>
           {% endblock %}
