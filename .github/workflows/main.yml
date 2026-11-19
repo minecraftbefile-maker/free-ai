@@ -5,8 +5,6 @@ on:
 
 jobs:
   deploy-ai-suite:
-    # ubuntu-latest typically provides 4 vCPU / 16 GB RAM / 14 GB SSD.
-    # If you still get 2 vCPU / 8 GB, switch to a larger runner label.
     runs-on: ubuntu-latest
 
     steps:
@@ -24,24 +22,25 @@ jobs:
           sudo chmod 600 /mnt/large-swapfile
           sudo mkswap /mnt/large-swapfile
           sudo swapon /mnt/large-swapfile
-          # Moderate swappiness lets the kernel evict idle pages while loading.
           sudo sysctl vm.swappiness=60
           free -h
 
       - name: Install Python Dependencies
         run: |
+          # 1. Force CPU-only PyTorch to prevent massive CUDA downloads
+          pip install --no-cache-dir \
+            --index-url https://download.pytorch.org/whl/cpu \
+            torch torchvision torchaudio
+
+          # 2. Install llama-cpp and web dependencies
           pip install llama-cpp-python[server] \
             --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu \
             --prefer-binary
           pip install huggingface-hub fastapi uvicorn jinja2 python-multipart itsdangerous psutil
 
-          # ----- AirLLM with CPU support -----
-          # Official PyPI package (v2.10.1+) already includes CPU inference.
+          # 3. Install AirLLM (CPU version is handled by the official package)
           pip install airllm
-          # Guard against a too-new transformers that may break AirLLM.
           pip install "transformers<5.0"
-
-          # Do NOT install bitsandbytes on a CPU runner.
 
       - name: Install cloudflared
         run: |
@@ -54,10 +53,8 @@ jobs:
 
           cat > proxy/main.py << 'PYEOF'
           import os
-
-          # ---------- Hugging Face download stability ----------
-          os.environ["HF_HUB_DISABLE_XET"] = "1"          # disable Xet backend
-          os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"    # use standard HTTPS
+          os.environ["HF_HUB_DISABLE_XET"] = "1"
+          os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
           cpu_count = os.cpu_count() or 4
           physical_cores = max(1, cpu_count // 2) if cpu_count > 2 else cpu_count
@@ -69,7 +66,6 @@ jobs:
           import hashlib
           import secrets
           import time
-          import traceback
           import threading
           import asyncio
           import datetime
@@ -77,9 +73,9 @@ jobs:
           import queue
           import subprocess
           from pathlib import Path
-          from typing import Optional, AsyncGenerator, List, Dict, Any
+          from typing import List, Dict, Any, AsyncGenerator
 
-          from fastapi import FastAPI, Request, Form, Depends, HTTPException, Query
+          from fastapi import FastAPI, Request, Form, Depends, HTTPException
           from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
           from fastapi.templating import Jinja2Templates
           from starlette.middleware.sessions import SessionMiddleware
@@ -87,20 +83,13 @@ jobs:
           from huggingface_hub import HfApi
           from llama_cpp import Llama
 
-          # ---------- AirLLM import (official package, CPU-capable) ----------
           try:
               from airllm import AutoModel as AirLLMAutoModel
               AIRLLM_AVAILABLE = True
           except ImportError:
-              AirLLMAutoModel = None
+              AIRLLMAutoModel = None
               AIRLLM_AVAILABLE = False
 
-          try:
-              from llama_cpp.llama_chat_format import MTMDChatHandler
-          except ImportError:
-              MTMDChatHandler = None
-
-          # ---------- Configuration ----------
           BASE_DIR = Path(__file__).parent.resolve()
           SECRET_KEY = secrets.token_hex(32)
           CONFIG_FILE = BASE_DIR / "data" / "config.json"
@@ -118,7 +107,6 @@ jobs:
           state_lock = threading.Lock()
           inference_lock = threading.Lock()
 
-          # ---------- Key Management ----------
           def load_keys() -> List[Dict[str, Any]]:
               if not KEYS_FILE.exists():
                   default_key = create_key_obj("Default Admin Key")
@@ -150,166 +138,96 @@ jobs:
                           break
                   save_keys(keys)
 
-          # ---------- Model Manager ----------
           class BaseModel:
-              def generate(self, messages, **kwargs) -> dict:
-                  raise NotImplementedError
-              def stream(self, messages, **kwargs) -> AsyncGenerator[dict, None]:
-                  raise NotImplementedError
-              def close(self):
-                  pass
+              def generate(self, messages, **kwargs) -> dict: raise NotImplementedError
+              def stream(self, messages, **kwargs) -> AsyncGenerator[dict, None]: raise NotImplementedError
+              def close(self): pass
 
           class LlamaCppModel(BaseModel):
               def __init__(self, model_path: str, n_ctx: int = 2048):
                   self.llm = Llama(
                       model_path=model_path,
-                      n_ctx=n_ctx,                # reduced KV-cache size
+                      n_ctx=n_ctx,
                       n_threads=physical_cores,
-                      n_threads_batch=physical_cores,  # do NOT use cpu_count
-                      n_batch=256,                # reduced peak RAM
+                      n_threads_batch=physical_cores,
+                      n_batch=256,
                       n_gpu_layers=0,
-                      use_mlock=False,            # allow swapping
-                      use_mmap=True,              # OS pages weights on demand
+                      use_mlock=False,
+                      use_mmap=True,
                       verbose=False,
                   )
                   self.model_name = Path(model_path).name
 
               def generate(self, messages, max_tokens=2048, **kwargs):
-                  return self.llm.create_chat_completion(
-                      messages=messages,
-                      max_tokens=max_tokens,
-                      **kwargs
-                  )
+                  return self.llm.create_chat_completion(messages=messages, max_tokens=max_tokens, **kwargs)
 
               async def stream(self, messages, max_tokens=2048, **kwargs):
-                  for chunk in self.llm.create_chat_completion(
-                      messages=messages,
-                      max_tokens=max_tokens,
-                      stream=True,
-                      **kwargs
-                  ):
+                  for chunk in self.llm.create_chat_completion(messages=messages, max_tokens=max_tokens, stream=True, **kwargs):
                       yield chunk
 
-              def close(self):
-                  self.llm.close()
+              def close(self): self.llm.close()
 
           class AirLLMModel(BaseModel):
               def __init__(self, repo_id: str, compression: str = None):
-                  if not AIRLLM_AVAILABLE:
-                      raise RuntimeError("AirLLM is not installed.")
-                  # Compression (4bit/8bit) requires CUDA; force None on CPU.
+                  if not AIRLLM_AVAILABLE: raise RuntimeError("AirLLM is not installed.")
                   try:
                       import torch
-                      if not torch.cuda.is_available():
-                          compression = None
-                  except ImportError:
-                      compression = None
-                  self.model = AirLLMAutoModel.from_pretrained(
-                      repo_id,
-                      compression=compression,
-                      device="cpu",          # explicit CPU placement
-                  )
+                      if not torch.cuda.is_available(): compression = None
+                  except ImportError: compression = None
+                  self.model = AirLLMAutoModel.from_pretrained(repo_id, compression=compression, device="cpu")
                   self.repo_id = repo_id
                   self.tokenizer = self.model.tokenizer
 
               def _format_prompt(self, messages: List[Dict[str, str]]) -> str:
                   if hasattr(self.tokenizer, "apply_chat_template"):
-                      return self.tokenizer.apply_chat_template(
-                          messages, tokenize=False, add_generation_prompt=True
-                      )
+                      return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                   prompt = ""
-                  for m in messages:
-                      prompt += f"{m.get('role','user')}: {m.get('content','')}\n"
-                  prompt += "assistant:"
-                  return prompt
+                  for m in messages: prompt += f"{m.get('role','user')}: {m.get('content','')}\n"
+                  return prompt + "assistant:"
 
               def generate(self, messages, max_tokens=512, **kwargs):
                   prompt = self._format_prompt(messages)
-                  input_tokens = self.tokenizer(
-                      [prompt], return_tensors="pt",
-                      return_attention_mask=False,
-                      truncation=True, max_length=4096,
-                  )
-                  output = self.model.generate(
-                      input_tokens["input_ids"],
-                      max_new_tokens=max_tokens,
-                      use_cache=True,
-                      return_dict_in_generate=True,
-                  )
+                  input_tokens = self.tokenizer([prompt], return_tensors="pt", return_attention_mask=False, truncation=True, max_length=4096)
+                  output = self.model.generate(input_tokens["input_ids"], max_new_tokens=max_tokens, use_cache=True, return_dict_in_generate=True)
                   text = self.tokenizer.decode(output.sequences[0], skip_special_tokens=True)
-                  if text.startswith(prompt):
-                      text = text[len(prompt):].lstrip()
+                  if text.startswith(prompt): text = text[len(prompt):].lstrip()
                   return {
                       "choices": [{"message": {"role": "assistant", "content": text}}],
-                      "usage": {
-                          "prompt_tokens": len(input_tokens["input_ids"][0]),
-                          "completion_tokens": len(output.sequences[0]) - len(input_tokens["input_ids"][0]),
-                          "total_tokens": len(output.sequences[0]),
-                      },
+                      "usage": {"prompt_tokens": len(input_tokens["input_ids"][0]), "completion_tokens": len(output.sequences[0]) - len(input_tokens["input_ids"][0]), "total_tokens": len(output.sequences[0])},
                   }
 
               async def stream(self, messages, max_tokens=512, **kwargs):
                   prompt = self._format_prompt(messages)
-                  input_tokens = self.tokenizer(
-                      [prompt], return_tensors="pt",
-                      return_attention_mask=False,
-                      truncation=True, max_length=4096,
-                  )
+                  input_tokens = self.tokenizer([prompt], return_tensors="pt", return_attention_mask=False, truncation=True, max_length=4096)
                   generated = input_tokens["input_ids"].clone()
                   for _ in range(max_tokens):
-                      output = self.model.generate(
-                          generated, max_new_tokens=1,
-                          use_cache=True, return_dict_in_generate=True,
-                      )
+                      output = self.model.generate(generated, max_new_tokens=1, use_cache=True, return_dict_in_generate=True)
                       new_token = output.sequences[0][-1:]
                       generated = output.sequences
                       token_text = self.tokenizer.decode(new_token, skip_special_tokens=True)
-                      if token_text:
-                          yield {"choices": [{"delta": {"content": token_text}, "index": 0, "finish_reason": None}]}
-                      if new_token.item() == self.tokenizer.eos_token_id:
-                          break
+                      if token_text: yield {"choices": [{"delta": {"content": token_text}, "index": 0, "finish_reason": None}]}
+                      if new_token.item() == self.tokenizer.eos_token_id: break
                   yield {"choices": [{"delta": {}, "index": 0, "finish_reason": "stop"}]}
 
-              def close(self):
-                  pass
+              def close(self): pass
 
           class ModelManager:
               def __init__(self):
                   self.models: Dict[str, BaseModel] = {}
                   self.model_runtimes: Dict[str, str] = {}
-                  self.last_stats: dict = {}
 
               def load_model(self, model_identifier: str, runtime: str = "llama-cpp", **kwargs):
-                  if runtime not in ("llama-cpp", "airllm"):
-                      raise HTTPException(status_code=400, detail="Runtime must be 'llama-cpp' or 'airllm'")
-                  if model_identifier in self.models:
-                      return
-
+                  if model_identifier in self.models: return
                   if runtime == "llama-cpp":
                       model_path = MODELS_DIR / model_identifier
-                      if not model_path.exists():
-                          raise HTTPException(status_code=404, detail=f"Model file '{model_identifier}' not found.")
-                      file_size = os.path.getsize(model_path)
-                      free_ram = psutil.virtual_memory().available
-                      free_swap = psutil.swap_memory().free
-                      total_free = free_ram + free_swap
-                      if file_size + (1024 * 1024 * 1024) > total_free:
-                          raise HTTPException(
-                              status_code=413,
-                              detail=f"OOM Risk: Model needs {file_size/1e9:.1f}GB, only {total_free/1e9:.1f}GB available."
-                          )
+                      if not model_path.exists(): raise HTTPException(status_code=404, detail="Model file not found.")
                       with inference_lock:
-                          model = LlamaCppModel(str(model_path), n_ctx=2048)
-                          self.models[model_identifier] = model
+                          self.models[model_identifier] = LlamaCppModel(str(model_path))
                           self.model_runtimes[model_identifier] = "llama-cpp"
-
                   elif runtime == "airllm":
-                      if not AIRLLM_AVAILABLE:
-                          raise HTTPException(status_code=503, detail="AirLLM is not available.")
+                      if not AIRLLM_AVAILABLE: raise HTTPException(status_code=503, detail="AirLLM is not available.")
                       with inference_lock:
-                          compression = kwargs.get("compression")
-                          model = AirLLMModel(model_identifier, compression=compression)
-                          self.models[model_identifier] = model
+                          self.models[model_identifier] = AirLLMModel(model_identifier, compression=kwargs.get("compression"))
                           self.model_runtimes[model_identifier] = "airllm"
 
               def unload_model(self, model_name: str):
@@ -322,43 +240,25 @@ jobs:
 
               def get_model(self, model_name: str) -> BaseModel:
                   if model_name not in self.models:
-                      if not self.models:
-                          raise RuntimeError("No models loaded. Please load a model first.")
+                      if not self.models: raise RuntimeError("No models loaded.")
                       model_name = list(self.models.keys())[0]
                   return self.models[model_name]
 
-              def get_runtime(self, model_name: str) -> str:
-                  return self.model_runtimes.get(model_name, "llama-cpp")
+              def get_runtime(self, model_name: str) -> str: return self.model_runtimes.get(model_name, "llama-cpp")
 
               def generate_sync(self, model_name: str, messages, **kwargs):
                   with inference_lock:
                       model = self.get_model(model_name)
-                      t0 = time.time()
-                      max_tokens = kwargs.pop("max_tokens", 2048)
-                      result = model.generate(messages, max_tokens=max_tokens, **kwargs)
-                      elapsed = time.time() - t0
-                      if isinstance(result, dict):
-                          result["model"] = model_name
-                          usage = result.get("usage", {})
-                          completion_tokens = usage.get("completion_tokens", 0)
-                          tps = completion_tokens / elapsed if elapsed > 0 else 0
-                          result["timings"] = {
-                              "total_time": round(elapsed, 3),
-                              "completion_tokens": completion_tokens,
-                              "tokens_per_second": round(tps, 2),
-                          }
-                          self.last_stats = result["timings"]
-                      return result
+                      return model.generate(messages, **kwargs)
 
               def stream_worker(self, model_name: str, messages, q: queue.Queue, stop_event: threading.Event, **kwargs):
                   try:
                       with inference_lock:
                           model = self.get_model(model_name)
-                          max_tokens = kwargs.pop("max_tokens", 2048)
                           loop = asyncio.new_event_loop()
                           asyncio.set_event_loop(loop)
                           async def run_stream():
-                              async for chunk in model.stream(messages, max_tokens=max_tokens, **kwargs):
+                              async for chunk in model.stream(messages, **kwargs):
                                   if stop_event.is_set(): break
                                   q.put(chunk)
                           loop.run_until_complete(run_stream())
@@ -371,15 +271,9 @@ jobs:
               async def stream_async(self, model_name: str, messages, key_id: str, request: Request, **kwargs) -> AsyncGenerator[str, None]:
                   stop_event = threading.Event()
                   q = queue.Queue()
-                  threading.Thread(
-                      target=self.stream_worker,
-                      args=(model_name, messages, q, stop_event),
-                      kwargs=kwargs, daemon=True
-                  ).start()
-
+                  threading.Thread(target=self.stream_worker, args=(model_name, messages, q, stop_event), kwargs=kwargs, daemon=True).start()
                   completion_tokens = 0
                   yield ": keep-alive\n\n"
-
                   try:
                       while True:
                           if await request.is_disconnected():
@@ -393,10 +287,8 @@ jobs:
                               yield f"data: {json.dumps({'error': chunk['error']})}\n\n"; break
                           if isinstance(chunk, dict):
                               chunk["model"] = model_name
-                              if chunk.get("choices"):
-                                  delta = chunk["choices"][0].get("delta", {})
-                                  if delta.get("content") or delta.get("tool_calls"):
-                                      completion_tokens += 1
+                              if chunk.get("choices") and chunk["choices"][0].get("delta", {}).get("content"):
+                                  completion_tokens += 1
                           yield f"data: {json.dumps(chunk)}\n\n"
                           await asyncio.sleep(0.01)
                       yield "data: [DONE]\n\n"
@@ -412,7 +304,6 @@ jobs:
 
           manager = ModelManager()
 
-          # ---------- Config Helpers ----------
           def hash_password(password: str) -> str:
               salt = secrets.token_hex(16)
               return f"{salt}${hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100_000).hex()}"
@@ -426,11 +317,9 @@ jobs:
           def load_config(): return json.loads(CONFIG_FILE.read_text()) if CONFIG_FILE.exists() else {}
           def save_config(cfg): CONFIG_FILE.write_text(json.dumps(cfg))
 
-          # ---------- Auth Dependencies ----------
           def require_user(request: Request):
               user = request.session.get("user")
-              if not user:
-                  raise HTTPException(status_code=303, headers={"Location": "/login"})
+              if not user: raise HTTPException(status_code=303, headers={"Location": "/login"})
               return user
 
           def require_api_user(request: Request):
@@ -442,13 +331,9 @@ jobs:
               for k in load_keys():
                   if k["key"] == token:
                       if not k["active"]: raise HTTPException(status_code=403, detail="Key revoked")
-                      if k["expires_at"] > 0 and time.time() > k["expires_at"]: raise HTTPException(status_code=403, detail="Key expired")
-                      if k["max_requests"] > 0 and k["requests_used"] >= k["max_requests"]: raise HTTPException(status_code=429, detail="Rate limit exceeded (Requests)")
-                      if k["max_tokens"] > 0 and k["tokens_used"] >= k["max_tokens"]: raise HTTPException(status_code=429, detail="Rate limit exceeded (Tokens)")
                       return k
               raise HTTPException(status_code=401, detail="Invalid API key")
 
-          # ---------- Web UI Routes ----------
           @app.get("/setup", response_class=HTMLResponse)
           async def setup_page(request: Request):
               if "password_hash" in load_config(): return RedirectResponse(url="/login")
@@ -457,8 +342,7 @@ jobs:
           @app.post("/setup")
           async def setup(request: Request, password: str = Form(...), confirm: str = Form(...)):
               if "password_hash" in load_config(): return RedirectResponse(url="/login")
-              if password != confirm or len(password) < 4:
-                  return templates.TemplateResponse(request, "setup.html", {"error": "Invalid password."})
+              if password != confirm or len(password) < 4: return templates.TemplateResponse(request, "setup.html", {"error": "Invalid password."})
               save_config({"password_hash": hash_password(password)})
               return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
 
@@ -484,38 +368,28 @@ jobs:
               loaded_models = list(manager.models.keys())
               gguf_models = sorted(f.name for f in MODELS_DIR.glob("*.gguf") if f.name not in loaded_models)
               return templates.TemplateResponse(request, "dashboard.html", {
-                  "user": user,
-                  "loaded_models": loaded_models,
-                  "available_gguf_models": gguf_models,
-                  "airllm_available": AIRLLM_AVAILABLE,
-                  "base_url": str(request.base_url).rstrip("/")
+                  "user": user, "loaded_models": loaded_models, "available_gguf_models": gguf_models,
+                  "airllm_available": AIRLLM_AVAILABLE, "base_url": str(request.base_url).rstrip("/")
               })
 
           @app.get("/playground", response_class=HTMLResponse)
           async def playground_page(request: Request, user: str = Depends(require_user)):
-              return templates.TemplateResponse(request, "playground.html", {
-                  "user": user, "loaded_models": list(manager.models.keys())
-              })
+              return templates.TemplateResponse(request, "playground.html", {"user": user, "loaded_models": list(manager.models.keys())})
 
           @app.get("/keys", response_class=HTMLResponse)
           async def keys_page(request: Request, user: str = Depends(require_user)):
               keys = load_keys()
               for k in keys:
                   k["masked"] = f"{k['key'][:8]}...{k['key'][-4:]}"
-                  if k["expires_at"] == 0:
-                      k["expires_str"] = "Never"
-                  else:
-                      k["expires_str"] = datetime.datetime.fromtimestamp(k["expires_at"]).strftime('%Y-%m-%d')
+                  k["expires_str"] = datetime.datetime.fromtimestamp(k["expires_at"]).strftime('%Y-%m-%d') if k["expires_at"] > 0 else "Never"
               return templates.TemplateResponse(request, "keys.html", {"user": user, "keys": keys})
 
           @app.get("/store", response_class=HTMLResponse)
           async def store_page(request: Request, user: str = Depends(require_user)):
               return templates.TemplateResponse(request, "store.html", {"user": user, "airllm_available": AIRLLM_AVAILABLE})
 
-          # ---------- Management APIs ----------
           @app.get("/api/keys")
-          async def api_list_keys(user: dict = Depends(require_api_user)):
-              return load_keys()
+          async def api_list_keys(user: dict = Depends(require_api_user)): return load_keys()
 
           @app.post("/api/keys")
           async def api_create_key(request: Request, user: dict = Depends(require_api_user)):
@@ -526,8 +400,7 @@ jobs:
 
           @app.delete("/api/keys/{key_id}")
           async def api_delete_key(key_id: str, user: dict = Depends(require_api_user)):
-              save_keys([k for k in load_keys() if k["id"] != key_id])
-              return {"status": "deleted"}
+              save_keys([k for k in load_keys() if k["id"] != key_id]); return {"status": "deleted"}
 
           @app.put("/api/keys/{key_id}/toggle")
           async def api_toggle_key(key_id: str, user: dict = Depends(require_api_user)):
@@ -539,27 +412,10 @@ jobs:
           @app.post("/api/load-model")
           async def api_load_model(request: Request, user: dict = Depends(require_api_user)):
               b = await request.json()
-              model_identifier = b.get("model_name")
-              runtime = b.get("runtime", "llama-cpp")
-              if runtime == "llama-cpp":
-                  path = MODELS_DIR / model_identifier
-                  if not path.exists():
-                      return JSONResponse(status_code=404, content={"error": "Model file not found"})
-                  identifier = model_identifier
-              else:
-                  identifier = model_identifier
               try:
-                  await asyncio.to_thread(
-                      manager.load_model,
-                      identifier,
-                      runtime=runtime,
-                      compression=b.get("compression")
-                  )
+                  await asyncio.to_thread(manager.load_model, b.get("model_name"), runtime=b.get("runtime", "llama-cpp"), compression=b.get("compression"))
                   return {"status": "ok"}
-              except HTTPException as e:
-                  return JSONResponse(status_code=e.status_code, content={"error": e.detail})
-              except Exception as e:
-                  return JSONResponse(status_code=500, content={"error": str(e)})
+              except Exception as e: return JSONResponse(status_code=500, content={"error": str(e)})
 
           @app.post("/api/unload-model")
           async def api_unload_model(request: Request, user: dict = Depends(require_api_user)):
@@ -570,65 +426,36 @@ jobs:
           @app.get("/api/store/search")
           async def api_store_search(q: str = "", vision_only: bool = False):
               try:
-                  models = await asyncio.to_thread(
-                      hf_api.list_models,
-                      search=q, filter="gguf", pipeline_tag="text-generation",
-                      sort="downloads", limit=30, expand=["tags"]
-                  )
-                  res = []
-                  for m in models:
-                      is_v = any(t in (m.tags or []) for t in ["vision", "multimodal"])
-                      if not vision_only or is_v:
-                          res.append({"id": m.id, "downloads": m.downloads, "is_vision": is_v})
-                  return res
-              except Exception as e:
-                  return JSONResponse(status_code=500, content={"error": str(e)})
+                  models = await asyncio.to_thread(hf_api.list_models, search=q, filter="gguf", pipeline_tag="text-generation", sort="downloads", limit=30, expand=["tags"])
+                  return [{"id": m.id, "downloads": m.downloads, "is_vision": any(t in (m.tags or []) for t in ["vision", "multimodal"])} for m in models]
+              except Exception as e: return JSONResponse(status_code=500, content={"error": str(e)})
 
           @app.get("/api/store/search-big")
           async def api_store_search_big(q: str = ""):
               try:
-                  models = await asyncio.to_thread(
-                      hf_api.list_models,
-                      search=q, pipeline_tag="text-generation",
-                      sort="downloads", limit=30, expand=["tags"]
-                  )
+                  models = await asyncio.to_thread(hf_api.list_models, search=q, pipeline_tag="text-generation", sort="downloads", limit=30, expand=["tags"])
                   return [{"id": m.id, "downloads": m.downloads} for m in models]
-              except Exception as e:
-                  return JSONResponse(status_code=500, content={"error": str(e)})
+              except Exception as e: return JSONResponse(status_code=500, content={"error": str(e)})
 
           @app.get("/api/store/files")
           async def api_store_files(repo_id: str, user: dict = Depends(require_api_user)):
               files = await asyncio.to_thread(hf_api.list_repo_files, repo_id=repo_id)
               return {"repo_id": repo_id, "files": sorted([f for f in files if f.endswith(".gguf")])}
 
-          # ---------- Robust curl‑based download ----------
           def robust_download(repo_id: str, filename: str, local_dir: str):
               url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
               dest = os.path.join(local_dir, filename)
-              subprocess.check_call([
-                  "curl", "-L", "-C", "-", "--retry", "5",
-                  "--retry-delay", "3", "-o", dest, url
-              ])
+              subprocess.check_call(["curl", "-L", "-C", "-", "--retry", "5", "--retry-delay", "3", "-o", dest, url])
 
           @app.post("/api/download-model")
           async def api_download_model(request: Request, user: dict = Depends(require_api_user)):
               b = await request.json()
-              await asyncio.to_thread(
-                  robust_download, b.get("repo_id"), b.get("filename"), str(MODELS_DIR)
-              )
+              await asyncio.to_thread(robust_download, b.get("repo_id"), b.get("filename"), str(MODELS_DIR))
               return {"status": "ok"}
 
-          # ---------- OpenAI-compatible API ----------
           @app.get("/v1/models")
           async def list_models(user: dict = Depends(require_api_user)):
-              loaded = list(manager.models.keys())
-              data = [{
-                  "id": m, "object": "model",
-                  "created": int(time.time()),
-                  "owned_by": "local",
-                  "runtime": manager.get_runtime(m)
-              } for m in loaded]
-              return {"object": "list", "data": data}
+              return {"object": "list", "data": [{"id": m, "object": "model", "created": int(time.time()), "owned_by": "local", "runtime": manager.get_runtime(m)} for m in manager.models]}
 
           @app.post("/v1/chat/completions")
           async def chat_completions(request: Request, user: dict = Depends(require_api_user)):
@@ -636,37 +463,475 @@ jobs:
               model_name = body.pop("model", "auto")
               messages = body.pop("messages", [])
               stream = body.pop("stream", False)
-              runtime_override = body.pop("runtime", None)
-              if runtime_override:
-                  actual_runtime = manager.get_runtime(model_name) if model_name in manager.models else None
-                  if actual_runtime and actual_runtime != runtime_override:
-                      raise HTTPException(status_code=400,
-                          detail=f"Model '{model_name}' is loaded with runtime '{actual_runtime}', not '{runtime_override}'")
               try:
                   if stream:
-                      return StreamingResponse(
-                          manager.stream_async(model_name, messages, user["id"], request, **body),
-                          media_type="text/event-stream",
-                          headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"}
-                      )
+                      return StreamingResponse(manager.stream_async(model_name, messages, user["id"], request, **body), media_type="text/event-stream")
                   res = await manager.generate_async(model_name, messages, **body)
                   await asyncio.to_thread(increment_usage, user["id"], res.get("usage", {}).get("completion_tokens", 0))
                   return JSONResponse(content=res)
-              except Exception as e:
-                  return JSONResponse(status_code=500, content={"error": str(e)})
+              except Exception as e: return JSONResponse(status_code=500, content={"error": str(e)})
 
           @app.get("/health")
-          async def health():
-              return {
-                  "status": "ok",
-                  "loaded_models": list(manager.models.keys()),
-                  "airllm_available": AIRLLM_AVAILABLE,
-              }
+          async def health(): return {"status": "ok", "loaded_models": list(manager.models.keys()), "airllm_available": AIRLLM_AVAILABLE}
           PYEOF
 
-          # ---------- Templates (omitted for brevity; paste original HTML here) ----------
-          # The full HTML templates are unchanged from the original workflow.
-          # Keep them exactly as they were in your previous file.
+          # ---------- base.html ----------
+          cat > proxy/templates/base.html << 'HTMLEOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>{% block title %}AI Suite{% endblock %}</title>
+            <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+            <style>
+              :root { --bg: #0d1117; --surface: #161b22; --border: #30363d; --text: #c9d1d9; --text-muted: #8b949e; --primary: #1f6feb; --primary-hover: #388bfd; --success: #238636; --error: #da3633; }
+              * { box-sizing: border-box; margin: 0; padding: 0; }
+              body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; background-color: var(--bg); color: var(--text); padding: 2rem 1rem; line-height: 1.5; font-size: 14px; }
+              .container { max-width: 960px; margin: 0 auto; }
+              .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid var(--border); }
+              .logo { font-size: 1.25rem; font-weight: 600; color: #fff; }
+              .card { background-color: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 1.5rem; margin-bottom: 1rem; }
+              .card h2 { font-size: 1rem; font-weight: 600; margin-bottom: 1rem; padding-bottom: 0.5rem; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+              label { display: block; font-size: 0.85rem; margin-bottom: 0.5rem; font-weight: 600; color: var(--text); }
+              input, select, textarea { width: 100%; padding: 0.5rem 0.75rem; background-color: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text); margin-bottom: 1rem; font-family: inherit; font-size: 14px; }
+              input:focus, select:focus, textarea:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px rgba(31, 111, 235, 0.3); }
+              button { padding: 0.5rem 1rem; background-color: var(--primary); color: #fff; border: 1px solid rgba(240,246,252,0.1); border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: 500; }
+              button:hover { background-color: var(--primary-hover); }
+              button:disabled { opacity: 0.5; cursor: not-allowed; }
+              .btn-secondary { background-color: #21262d; color: var(--text); border-color: var(--border); }
+              .btn-secondary:hover { background-color: #30363d; }
+              .btn-danger { background-color: var(--error); border-color: rgba(240,246,252,0.1); }
+              .btn-danger:hover { background-color: #f85149; }
+              .row { display: flex; gap: 0.75rem; align-items: center; }
+              .input-group { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+              .input-group input { margin-bottom: 0; }
+              .auth-wrap { max-width: 400px; margin: 6rem auto 2rem; }
+              .muted { color: var(--text-muted); font-size: 0.9rem; }
+              .nav-link { color: var(--text); text-decoration: none; padding: 0.5rem 1rem; border-radius: 4px; font-weight: 500; font-size: 14px; }
+              .nav-link:hover { background-color: #21262d; }
+              .nav-link.active { background-color: #1f6feb22; color: var(--primary-hover); }
+              .error { color: #f85149; background-color: #da363322; border: 1px solid #da363366; padding: 0.75rem; border-radius: 4px; margin-bottom: 1rem; font-size: 14px; }
+              .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 2em; font-size: 0.75rem; font-weight: 600; border: 1px solid var(--border); background-color: #21262d; }
+              .markdown-body p { margin-bottom: 0.75rem; }
+              .markdown-body ul, .markdown-body ol { margin-left: 1.5rem; margin-bottom: 0.75rem; }
+              .markdown-body code { background: rgba(110,118,129,0.4); padding: 0.2rem 0.4rem; border-radius: 4px; font-family: monospace; font-size: 85%; }
+              .markdown-body pre { background: #161b22; padding: 1rem; border-radius: 6px; overflow-x: auto; margin-bottom: 0.75rem; border: 1px solid var(--border); }
+              .markdown-body pre code { background: transparent; padding: 0; }
+              #loadingOverlay { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(13, 17, 23, 0.8); display: none; justify-content: center; align-items: center; z-index: 9999; flex-direction: column; gap: 1rem; }
+              #loadingText { font-size: 1rem; font-weight: 500; color: #fff; }
+            </style>
+          </head>
+          <body>
+            <div id="loadingOverlay"><div id="loadingText">Loading...</div></div>
+            {% block body %}{% endblock %}
+            <script>
+              function showLoading(text) { document.getElementById('loadingText').innerText = text; document.getElementById('loadingOverlay').style.display = 'flex'; }
+              function hideLoading() { document.getElementById('loadingOverlay').style.display = 'none'; }
+              function copyText(text, btn) { navigator.clipboard.writeText(text).then(() => { const orig = btn.textContent; btn.textContent = 'Copied!'; setTimeout(() => btn.textContent = orig, 1500); }); }
+            </script>
+          </body>
+          </html>
+          HTMLEOF
+
+          # ---------- setup.html ----------
+          cat > proxy/templates/setup.html << 'HTMLEOF'
+          {% extends "base.html" %}
+          {% block body %}
+          <div class="auth-wrap">
+            <div class="card">
+              <h2>Setup Admin Password</h2>
+              {% if error %}<div class="error">{{ error }}</div>{% endif %}
+              <form method="post" action="/setup">
+                <label>Password</label>
+                <input type="password" name="password" required minlength="4" autofocus>
+                <label>Confirm Password</label>
+                <input type="password" name="confirm" required minlength="4">
+                <button type="submit" style="width: 100%;">Create</button>
+              </form>
+            </div>
+          </div>
+          {% endblock %}
+          HTMLEOF
+
+          # ---------- login.html ----------
+          cat > proxy/templates/login.html << 'HTMLEOF'
+          {% extends "base.html" %}
+          {% block body %}
+          <div class="auth-wrap">
+            <div class="card">
+              <h2>Sign In</h2>
+              {% if error %}<div class="error">{{ error }}</div>{% endif %}
+              <form method="post" action="/login">
+                <label>Password</label>
+                <input type="password" name="password" required autofocus>
+                <button type="submit" style="width: 100%;">Login</button>
+              </form>
+            </div>
+          </div>
+          {% endblock %}
+          HTMLEOF
+
+          # ---------- dashboard.html ----------
+          cat > proxy/templates/dashboard.html << 'HTMLEOF'
+          {% extends "base.html" %}
+          {% block body %}
+          <div class="container">
+            <div class="header">
+              <div class="logo">AI Suite</div>
+              <div class="row">
+                <a href="/" class="nav-link active">Dashboard</a>
+                <a href="/playground" class="nav-link">Playground</a>
+                <a href="/keys" class="nav-link">API Keys</a>
+                <a href="/store" class="nav-link">Store</a>
+                <span class="muted" style="margin-left: 1rem;">{{ user }}</span>
+                <a href="/logout" class="btn-secondary">Logout</a>
+              </div>
+            </div>
+            <div class="card">
+              <h2>Loaded Models</h2>
+              {% if loaded_models %}
+                {% for m in loaded_models %}
+                <div class="row" style="border-bottom: 1px solid var(--border); padding: 0.75rem 0;">
+                  <div style="flex: 1;">
+                    <strong>{{ m }}</strong>
+                    <span class="badge" style="margin-left: 0.5rem;">{{ manager.get_runtime(m) }}</span>
+                  </div>
+                  <button class="btn-danger" onclick="unloadModel('{{ m }}')">Unload</button>
+                </div>
+                {% endfor %}
+              {% else %}
+                <p class="muted">No models currently loaded.</p>
+              {% endif %}
+            </div>
+            {% if available_gguf_models or airllm_available %}
+            <div class="card">
+              <h2>Load Model</h2>
+              <form id="loadModelForm">
+                <div class="row" style="margin-bottom: 1rem;">
+                  <div style="flex: 1;">
+                    <label>Runtime</label>
+                    <select id="runtimeSelect" name="runtime">
+                      <option value="llama-cpp" selected>llama-cpp (GGUF)</option>
+                      {% if airllm_available %}
+                      <option value="airllm">AirLLM (Hugging Face)</option>
+                      {% endif %}
+                    </select>
+                  </div>
+                  <div style="flex: 1;" id="ggufSelector">
+                    <label>GGUF Model File</label>
+                    <select id="ggufModelSelect" name="model_name">
+                      {% for m in available_gguf_models %}
+                      <option value="{{ m }}">{{ m }}</option>
+                      {% endfor %}
+                    </select>
+                  </div>
+                  <div style="flex: 1; display: none;" id="airllmSelector">
+                    <label>Hugging Face Repo ID</label>
+                    <input type="text" id="airllmRepoInput" placeholder="e.g. meta-llama/Llama-3-70B" style="margin: 0;">
+                  </div>
+                </div>
+                <div class="row" style="margin-bottom: 1rem; display: none;" id="airllmOptions">
+                  <div style="flex: 1;">
+                    <label>Compression (optional)</label>
+                    <select id="compressionSelect">
+                      <option value="">None</option>
+                      <option value="4bit">4-bit (requires bitsandbytes)</option>
+                      <option value="8bit">8-bit (requires bitsandbytes)</option>
+                    </select>
+                  </div>
+                </div>
+                <button type="submit">Load</button>
+              </form>
+            </div>
+            {% endif %}
+            <div class="card">
+              <h2>API Configuration</h2>
+              <label>Base URL</label>
+              <div class="input-group">
+                <input type="text" id="baseUrl" value="{{ base_url }}/v1" readonly>
+                <button class="btn-secondary" onclick="copyText(document.getElementById('baseUrl').value, this)">Copy</button>
+              </div>
+            </div>
+          </div>
+          <script>
+            const runtimeSelect = document.getElementById('runtimeSelect');
+            const ggufSelector = document.getElementById('ggufSelector');
+            const airllmSelector = document.getElementById('airllmSelector');
+            const airllmOptions = document.getElementById('airllmOptions');
+            runtimeSelect.addEventListener('change', () => {
+              if (runtimeSelect.value === 'airllm') {
+                ggufSelector.style.display = 'none'; airllmSelector.style.display = 'block'; airllmOptions.style.display = 'block';
+              } else {
+                ggufSelector.style.display = 'block'; airllmSelector.style.display = 'none'; airllmOptions.style.display = 'none';
+              }
+            });
+            document.getElementById('loadModelForm').addEventListener('submit', async (e) => {
+              e.preventDefault();
+              showLoading(`Loading model...`);
+              const runtime = runtimeSelect.value;
+              const modelName = runtime === 'llama-cpp' ? document.getElementById('ggufModelSelect').value : document.getElementById('airllmRepoInput').value.trim();
+              if (!modelName) { alert('Please enter a model name.'); hideLoading(); return; }
+              const payload = { model_name: modelName, runtime: runtime, compression: runtime === 'airllm' ? document.getElementById('compressionSelect').value || undefined : undefined };
+              const res = await fetch('/api/load-model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+              if (res.ok) window.location.reload();
+              else { const err = await res.json(); alert(err.error || 'Failed to load model.'); hideLoading(); }
+            });
+            async function unloadModel(name) {
+              showLoading(`Unloading...`);
+              await fetch('/api/unload-model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model_name: name }) });
+              setTimeout(() => window.location.reload(), 2000);
+            }
+          </script>
+          {% endblock %}
+          HTMLEOF
+
+          # ---------- playground.html ----------
+          cat > proxy/templates/playground.html << 'HTMLEOF'
+          {% extends "base.html" %}
+          {% block body %}
+          <div class="container">
+            <div class="header">
+              <div class="logo">AI Suite</div>
+              <div class="row">
+                <a href="/" class="nav-link">Dashboard</a>
+                <a href="/playground" class="nav-link active">Playground</a>
+                <a href="/keys" class="nav-link">API Keys</a>
+                <a href="/store" class="nav-link">Store</a>
+                <span class="muted" style="margin-left: 1rem;">{{ user }}</span>
+                <a href="/logout" class="btn-secondary">Logout</a>
+              </div>
+            </div>
+            <div class="card" style="display: flex; flex-direction: column; height: 75vh;">
+              <div class="row" style="margin-bottom: 1rem;">
+                <select id="modelSelect" style="margin: 0;">
+                  {% for m in loaded_models %}
+                  <option value="{{ m }}">{{ m }}</option>
+                  {% else %}
+                  <option value="">No models loaded</option>
+                  {% endfor %}
+                </select>
+              </div>
+              <details style="margin-bottom: 1rem;">
+                <summary style="cursor: pointer; color: var(--text-muted); font-size: 0.9rem;">Settings</summary>
+                <div style="margin-top: 0.5rem; padding: 0.5rem; background: var(--bg); border: 1px solid var(--border); border-radius: 4px;">
+                  <label>System Prompt</label>
+                  <textarea id="systemPrompt" rows="2">You are a helpful assistant.</textarea>
+                  <div class="row">
+                    <div style="flex: 1;"><label>Temp</label><input type="number" id="tempInput" value="0.7" step="0.1" min="0" max="2"></div>
+                    <div style="flex: 1;"><label>Max Tokens</label><input type="number" id="maxTokensInput" value="1024" step="128" min="1"></div>
+                  </div>
+                </div>
+              </details>
+              <div id="chatBox" style="flex: 1; overflow-y: auto; border: 1px solid var(--border); border-radius: 4px; padding: 1rem; margin-bottom: 1rem; background: #000;">
+                <div class="muted" style="text-align: center; margin-top: 2rem;">Start a conversation...</div>
+              </div>
+              <form id="chatForm" class="row">
+                <input type="text" id="chatInput" placeholder="Type a message..." style="flex: 1; margin: 0;" required {% if not loaded_models %}disabled{% endif %}>
+                <button type="submit" id="sendBtn" {% if not loaded_models %}disabled{% endif %}>Send</button>
+                <button type="button" id="stopBtn" class="btn-danger" style="display: none;">Stop</button>
+              </form>
+            </div>
+          </div>
+          <script>
+            const chatBox = document.getElementById('chatBox'); const chatForm = document.getElementById('chatForm'); const chatInput = document.getElementById('chatInput');
+            const modelSelect = document.getElementById('modelSelect'); const sendBtn = document.getElementById('sendBtn'); const stopBtn = document.getElementById('stopBtn');
+            let history = []; let abortController = null;
+            function appendMessage(role, text) {
+              const div = document.createElement('div'); div.style.marginBottom = '1rem'; div.style.paddingBottom = '1rem'; div.style.borderBottom = '1px solid var(--border)';
+              div.innerHTML = `<strong>${role === 'user' ? 'User' : 'Assistant'}:</strong><br>${text}`; chatBox.appendChild(div); chatBox.scrollTop = chatBox.scrollHeight; return div;
+            }
+            stopBtn.addEventListener('click', () => { if (abortController) abortController.abort(); });
+            chatForm.addEventListener('submit', async (e) => {
+              e.preventDefault();
+              const text = chatInput.value; chatInput.value = ''; appendMessage('user', text); history.push({ role: 'user', content: text });
+              const aiDiv = appendMessage('assistant', '...');
+              let sysPrompt = document.getElementById('systemPrompt').value.trim();
+              let messagesToSend = sysPrompt ? [{ role: 'system', content: sysPrompt }, ...history] : history;
+              abortController = new AbortController();
+              sendBtn.disabled = true; stopBtn.style.display = 'inline-block';
+              try {
+                const res = await fetch('/v1/chat/completions', {
+                  method: 'POST', headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ model: modelSelect.value, messages: messagesToSend, stream: true, temperature: parseFloat(document.getElementById('tempInput').value) || 0.7, max_tokens: parseInt(document.getElementById('maxTokensInput').value) || 1024 }),
+                  signal: abortController.signal
+                });
+                const reader = res.body.getReader(); const decoder = new TextDecoder(); let aiText = '';
+                while (true) {
+                  const { done, value } = await reader.read(); if (done) break;
+                  const chunk = decoder.decode(value); const lines = chunk.split('\n');
+                  for (const line of lines) {
+                    if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+                      try {
+                        const data = JSON.parse(line.slice(6));
+                        if (data.choices && data.choices[0].delta && data.choices[0].delta.content) {
+                          aiText += data.choices[0].delta.content;
+                          aiDiv.innerHTML = `<strong>Assistant:</strong><br><div class="markdown-body">${marked.parse(aiText)}</div>`; chatBox.scrollTop = chatBox.scrollHeight;
+                        }
+                      } catch (err) {}
+                    }
+                  }
+                }
+                history.push({ role: 'assistant', content: aiText });
+              } catch (err) {
+                if (err.name !== 'AbortError') aiDiv.innerHTML = `<strong>Assistant:</strong> <span style="color: var(--error)">Error: ${err.message}</span>`;
+              } finally { sendBtn.disabled = false; stopBtn.style.display = 'none'; abortController = null; }
+            });
+          </script>
+          {% endblock %}
+          HTMLEOF
+
+          # ---------- keys.html ----------
+          cat > proxy/templates/keys.html << 'HTMLEOF'
+          {% extends "base.html" %}
+          {% block body %}
+          <div class="container">
+            <div class="header">
+              <div class="logo">AI Suite</div>
+              <div class="row">
+                <a href="/" class="nav-link">Dashboard</a>
+                <a href="/playground" class="nav-link">Playground</a>
+                <a href="/keys" class="nav-link active">API Keys</a>
+                <a href="/store" class="nav-link">Store</a>
+                <span class="muted" style="margin-left: 1rem;">{{ user }}</span>
+                <a href="/logout" class="btn-secondary">Logout</a>
+              </div>
+            </div>
+            <div class="card">
+              <h2>Create Key</h2>
+              <form id="createKeyForm">
+                <div class="row" style="margin-bottom: 1rem;">
+                  <div style="flex: 2;"><label>Name</label><input type="text" id="keyName" placeholder="e.g. App Key" required></div>
+                  <div style="flex: 1;"><label>Expires (Days)</label><input type="number" id="keyExpiry" placeholder="0 = Never" value="0"></div>
+                </div>
+                <button type="submit">Generate</button>
+              </form>
+              <div id="newKeyDisplay" style="display: none; margin-top: 1rem; padding: 1rem; border: 1px solid var(--border); border-radius: 4px; background: var(--bg);">
+                <p style="margin-bottom: 0.5rem; font-weight: 600;">Key Generated:</p>
+                <div class="input-group">
+                  <input type="text" id="generatedKey" readonly style="font-family: monospace;">
+                  <button class="btn-secondary" onclick="copyText(document.getElementById('generatedKey').value, this)">Copy</button>
+                </div>
+              </div>
+            </div>
+            <div class="card">
+              <h2>Existing Keys</h2>
+              <table style="width: 100%; border-collapse: collapse; margin-top: 1rem; font-size: 14px;">
+                <thead><tr><th style="text-align: left; padding: 0.5rem; border-bottom: 1px solid var(--border);">Name</th><th style="text-align: left; padding: 0.5rem; border-bottom: 1px solid var(--border);">Key</th><th style="text-align: left; padding: 0.5rem; border-bottom: 1px solid var(--border);">Status</th><th style="text-align: left; padding: 0.5rem; border-bottom: 1px solid var(--border);">Actions</th></tr></thead>
+                <tbody>
+                  {% for k in keys %}
+                  <tr>
+                    <td style="padding: 0.5rem; border-bottom: 1px solid var(--border);">{{ k.name }}</td>
+                    <td style="padding: 0.5rem; border-bottom: 1px solid var(--border); font-family: monospace; font-size: 12px;">{{ k.masked }}</td>
+                    <td style="padding: 0.5rem; border-bottom: 1px solid var(--border);"><span class="badge" style="background: {{ 'var(--success)' if k.active else 'var(--error)' }}; color: white; border: none;">{{ 'Active' if k.active else 'Revoked' }}</span></td>
+                    <td style="padding: 0.5rem; border-bottom: 1px solid var(--border);">
+                      <button class="btn-secondary" style="padding: 0.2rem 0.4rem; font-size: 12px;" onclick="toggleKey('{{ k.id }}')">{{ 'Disable' if k.active else 'Enable' }}</button>
+                      <button class="btn-danger" style="padding: 0.2rem 0.4rem; font-size: 12px;" onclick="deleteKey('{{ k.id }}')">Delete</button>
+                    </td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <script>
+            document.getElementById('createKeyForm').addEventListener('submit', async (e) => {
+              e.preventDefault(); showLoading('Generating...');
+              const res = await fetch('/api/keys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: document.getElementById('keyName').value, expires_days: document.getElementById('keyExpiry').value }) });
+              if (res.ok) {
+                const data = await res.json(); document.getElementById('newKeyDisplay').style.display = 'block'; document.getElementById('generatedKey').value = data.key; document.getElementById('createKeyForm').reset(); hideLoading();
+                setTimeout(() => window.location.reload(), 10000);
+              } else { alert('Failed'); hideLoading(); }
+            });
+            async function toggleKey(id) { await fetch(`/api/keys/${id}/toggle`, { method: 'PUT' }); window.location.reload(); }
+            async function deleteKey(id) { if (confirm('Delete this key?')) { await fetch(`/api/keys/${id}`, { method: 'DELETE' }); window.location.reload(); } }
+          </script>
+          {% endblock %}
+          HTMLEOF
+
+          # ---------- store.html ----------
+          cat > proxy/templates/store.html << 'HTMLEOF'
+          {% extends "base.html" %}
+          {% block body %}
+          <div class="container">
+            <div class="header">
+              <div class="logo">AI Suite</div>
+              <div class="row">
+                <a href="/" class="nav-link">Dashboard</a>
+                <a href="/playground" class="nav-link">Playground</a>
+                <a href="/keys" class="nav-link">API Keys</a>
+                <a href="/store" class="nav-link active">Store</a>
+                <span class="muted" style="margin-left: 1rem;">{{ user }}</span>
+                <a href="/logout" class="btn-secondary">Logout</a>
+              </div>
+            </div>
+            <div class="card">
+              <h2>Search Models</h2>
+              <div class="row" style="margin-bottom: 1rem;">
+                <input type="text" id="searchInput" placeholder="Search name..." style="margin: 0; flex: 1;">
+                <button id="searchBtn" style="margin: 0;">Search</button>
+              </div>
+              <p class="muted" style="margin-bottom: 0;">
+                <label style="display: inline-flex; align-items: center; gap: 0.5rem;">
+                  <input type="checkbox" id="showBigModels" style="margin: 0;"> Show big models (suitable for AirLLM)
+                </label>
+              </p>
+            </div>
+            <div id="resultsContainer" class="card" style="display: none;">
+              <h2>Results</h2>
+              <div id="resultsList"></div>
+            </div>
+          </div>
+          <script>
+            async function searchModels() {
+              const q = document.getElementById('searchInput').value; const big = document.getElementById('showBigModels').checked;
+              showLoading('Searching...');
+              const res = await fetch(big ? `/api/store/search-big?q=${encodeURIComponent(q)}` : `/api/store/search?q=${encodeURIComponent(q)}`);
+              const models = await res.json(); hideLoading();
+              const list = document.getElementById('resultsList'); list.innerHTML = models.length ? '' : '<p class="muted">No models found.</p>';
+              models.forEach(m => {
+                const safeId = m.id.replace(/[^a-zA-Z0-9]/g, '_');
+                list.innerHTML += `
+                  <div class="row" style="border-bottom: 1px solid var(--border); padding: 0.75rem 0;">
+                    <div style="flex: 1;">
+                      <div style="font-weight: 600;">${m.id} ${big ? '<span class="badge">Big</span>' : ''}</div>
+                      <div class="muted" style="font-size: 0.85rem;">${m.downloads} downloads</div>
+                    </div>
+                    <div id="actions_${safeId}">
+                      ${big ? `<button class="btn-secondary" onclick="loadAirLLM('${m.id}')">Load via AirLLM</button>` : `<button class="btn-secondary" onclick="fetchFiles('${m.id}', this)">Get Files</button>`}
+                    </div>
+                  </div>
+                `;
+              });
+              document.getElementById('resultsContainer').style.display = 'block';
+            }
+            document.getElementById('searchBtn').addEventListener('click', searchModels);
+            document.getElementById('searchInput').addEventListener('keypress', (e) => { if (e.key === 'Enter') searchModels(); });
+            window.onload = searchModels;
+            async function fetchFiles(repoId, btn) {
+              btn.innerText = 'Fetching...';
+              const res = await fetch(`/api/store/files?repo_id=${encodeURIComponent(repoId)}`);
+              const data = await res.json();
+              if (data.files.length === 0) { btn.innerText = 'No GGUF'; return; }
+              const selectId = 'select_' + repoId.replace(/[^a-zA-Z0-9]/g, '_');
+              btn.parentElement.innerHTML = `
+                <div class="row"><select id="${selectId}" style="padding: 0.4rem; margin: 0; font-size: 0.85rem;">${data.files.map(f => `<option value="${f}">${f}</option>`).join('')}</select>
+                <button onclick="downloadSelected('${repoId}', '${selectId}')">Download</button></div>
+              `;
+            }
+            async function downloadSelected(repoId, selectId) {
+              showLoading(`Downloading...`);
+              const res = await fetch('/api/download-model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ repo_id: repoId, filename: document.getElementById(selectId).value }) });
+              if (res.ok) window.location.href = '/'; else { alert('Download failed.'); hideLoading(); }
+            }
+            async function loadAirLLM(repoId) {
+              if (!confirm(`Load "${repoId}" via AirLLM?`)) return;
+              showLoading(`Loading ${repoId} via AirLLM...`);
+              const res = await fetch('/api/load-model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model_name: repoId, runtime: 'airllm' }) });
+              if (res.ok) window.location.href = '/'; else { const err = await res.json(); alert(err.error || 'Failed'); hideLoading(); }
+            }
+          </script>
+          {% endblock %}
+          HTMLEOF
 
       - name: Start Custom Proxy
         run: |
