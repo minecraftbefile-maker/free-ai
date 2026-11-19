@@ -22,13 +22,13 @@ jobs:
           sudo chmod 600 /mnt/large-swapfile
           sudo mkswap /mnt/large-swapfile
           sudo swapon /mnt/large-swapfile
-          # MODIFIED: Swappiness increased to 60 to allow memory swapping during model load
+          # Swappiness increased to 60 to allow swapping during large model load
           sudo sysctl vm.swappiness=60
           free -h
 
       - name: Install Python Dependencies
         run: |
-          # MODIFIED: Force CPU-only PyTorch to prevent massive NVIDIA CUDA downloads
+          # 1. Force CPU-only PyTorch to prevent downloading 5GB of NVIDIA CUDA libraries
           pip install --no-cache-dir \
             --index-url https://download.pytorch.org/whl/cpu \
             torch torchvision torchaudio
@@ -38,7 +38,7 @@ jobs:
             --prefer-binary
           pip install huggingface-hub fastapi uvicorn jinja2 python-multipart itsdangerous psutil
           
-          # MODIFIED: Install official AirLLM and pin transformers to avoid breaking changes
+          # 2. Install official AirLLM and pin transformers to avoid breaking changes
           pip install airllm
           pip install "transformers<5.0"
 
@@ -53,7 +53,7 @@ jobs:
 
           cat > proxy/main.py << 'PYEOF'
           import os
-          # MODIFIED: Disable HuggingFace Xet backend which causes hangs on CI runners
+          # Disable HuggingFace Xet backend which causes hangs on CI runners
           os.environ["HF_HUB_DISABLE_XET"] = "1"
           os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
@@ -119,8 +119,10 @@ jobs:
                   default_key = create_key_obj("Default Admin Key")
                   save_keys([default_key])
                   return [default_key]
-              try: return json.loads(KEYS_FILE.read_text())
-              except: return []
+              try: 
+                  return json.loads(KEYS_FILE.read_text())
+              except Exception: 
+                  return []
 
           def save_keys(keys: List[Dict[str, Any]]):
               with state_lock: KEYS_FILE.write_text(json.dumps(keys, indent=2))
@@ -152,7 +154,7 @@ jobs:
 
           class LlamaCppModel(BaseModel):
               def __init__(self, model_path: str, n_ctx: int = 2048):
-                  # MODIFIED: Reduced n_ctx and n_batch, disabled mlock to save RAM
+                  # Reduced n_ctx and n_batch, disabled mlock to save RAM
                   self.llm = Llama(
                       model_path=model_path,
                       n_ctx=n_ctx,
@@ -178,7 +180,7 @@ jobs:
           class AirLLMModel(BaseModel):
               def __init__(self, repo_id: str, compression: str = None):
                   if not AIRLLM_AVAILABLE: raise RuntimeError("AirLLM is not installed.")
-                  # MODIFIED: Force CPU mode and disable compression if CUDA is not available
+                  # Force CPU mode and disable compression if CUDA is not available
                   try:
                       import torch
                       if not torch.cuda.is_available(): compression = None
@@ -323,7 +325,13 @@ jobs:
                   return secrets.compare_digest(hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100_000).hex(), expected)
               except: return False
 
-          def load_config(): return json.loads(CONFIG_FILE.read_text()) if CONFIG_FILE.exists() else {}
+          # Fixed: Safely handle corrupted or missing config files to prevent 500 errors
+          def load_config():
+              try:
+                  return json.loads(CONFIG_FILE.read_text()) if CONFIG_FILE.exists() else {}
+              except Exception:
+                  return {}
+
           def save_config(cfg): CONFIG_FILE.write_text(json.dumps(cfg))
 
           def require_user(request: Request):
@@ -343,31 +351,30 @@ jobs:
                       return k
               raise HTTPException(status_code=401, detail="Invalid API key")
 
-          # MODIFIED: FastAPI TemplateResponse syntax updated to {"request": request} to prevent 500 errors
-
+          # Fixed: Reverted to original TemplateResponse syntax to support modern FastAPI versions
           @app.get("/setup", response_class=HTMLResponse)
           async def setup_page(request: Request):
               if "password_hash" in load_config(): return RedirectResponse(url="/login")
-              return templates.TemplateResponse("setup.html", {"request": request})
+              return templates.TemplateResponse(request, "setup.html", {})
 
           @app.post("/setup")
           async def setup(request: Request, password: str = Form(...), confirm: str = Form(...)):
               if "password_hash" in load_config(): return RedirectResponse(url="/login")
-              if password != confirm or len(password) < 4: return templates.TemplateResponse("setup.html", {"request": request, "error": "Invalid password."})
+              if password != confirm or len(password) < 4: return templates.TemplateResponse(request, "setup.html", {"error": "Invalid password."})
               save_config({"password_hash": hash_password(password)})
               return RedirectResponse(url="/login", status_code=HTTP_303_SEE_OTHER)
 
           @app.get("/login", response_class=HTMLResponse)
           async def login_page(request: Request):
               if "password_hash" not in load_config(): return RedirectResponse(url="/setup")
-              return templates.TemplateResponse("login.html", {"request": request})
+              return templates.TemplateResponse(request, "login.html", {})
 
           @app.post("/login")
           async def login(request: Request, password: str = Form(...)):
               if check_password(password, load_config().get("password_hash", "")):
                   request.session["user"] = "admin"
                   return RedirectResponse(url="/", status_code=HTTP_303_SEE_OTHER)
-              return templates.TemplateResponse("login.html", {"request": request, "error": "Wrong password."})
+              return templates.TemplateResponse(request, "login.html", {"error": "Wrong password."})
 
           @app.get("/logout")
           async def logout(request: Request):
@@ -378,14 +385,14 @@ jobs:
           async def dashboard(request: Request, user: str = Depends(require_user)):
               loaded_models = list(manager.models.keys())
               gguf_models = sorted(f.name for f in MODELS_DIR.glob("*.gguf") if f.name not in loaded_models)
-              return templates.TemplateResponse("dashboard.html", {
-                  "request": request, "user": user, "loaded_models": loaded_models, "available_gguf_models": gguf_models,
+              return templates.TemplateResponse(request, "dashboard.html", {
+                  "user": user, "loaded_models": loaded_models, "available_gguf_models": gguf_models,
                   "airllm_available": AIRLLM_AVAILABLE, "base_url": str(request.base_url).rstrip("/")
               })
 
           @app.get("/playground", response_class=HTMLResponse)
           async def playground_page(request: Request, user: str = Depends(require_user)):
-              return templates.TemplateResponse("playground.html", {"request": request, "user": user, "loaded_models": list(manager.models.keys())})
+              return templates.TemplateResponse(request, "playground.html", {"user": user, "loaded_models": list(manager.models.keys())})
 
           @app.get("/keys", response_class=HTMLResponse)
           async def keys_page(request: Request, user: str = Depends(require_user)):
@@ -393,11 +400,11 @@ jobs:
               for k in keys:
                   k["masked"] = f"{k['key'][:8]}...{k['key'][-4:]}"
                   k["expires_str"] = datetime.datetime.fromtimestamp(k["expires_at"]).strftime('%Y-%m-%d') if k["expires_at"] > 0 else "Never"
-              return templates.TemplateResponse("keys.html", {"request": request, "user": user, "keys": keys})
+              return templates.TemplateResponse(request, "keys.html", {"user": user, "keys": keys})
 
           @app.get("/store", response_class=HTMLResponse)
           async def store_page(request: Request, user: str = Depends(require_user)):
-              return templates.TemplateResponse("store.html", {"request": request, "user": user, "airllm_available": AIRLLM_AVAILABLE})
+              return templates.TemplateResponse(request, "store.html", {"user": user, "airllm_available": AIRLLM_AVAILABLE})
 
           @app.get("/api/keys")
           async def api_list_keys(user: dict = Depends(require_api_user)): return load_keys()
@@ -453,7 +460,6 @@ jobs:
               files = await asyncio.to_thread(hf_api.list_repo_files, repo_id=repo_id)
               return {"repo_id": repo_id, "files": sorted([f for f in files if f.endswith(".gguf")])}
 
-          # MODIFIED: Robust curl downloader to bypass HuggingFace Xet stalling
           def robust_download(repo_id: str, filename: str, local_dir: str):
               url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
               dest = os.path.join(local_dir, filename)
@@ -487,7 +493,7 @@ jobs:
           async def health(): return {"status": "ok", "loaded_models": list(manager.models.keys()), "airllm_available": AIRLLM_AVAILABLE}
           PYEOF
 
-          # ---------- base.html (Generic Style) ----------
+          # ---------- base.html ----------
           cat > proxy/templates/base.html << 'HTMLEOF'
           <!DOCTYPE html>
           <html lang="en">
@@ -592,7 +598,7 @@ jobs:
           </html>
           HTMLEOF
 
-          # ---------- setup.html (unchanged) ----------
+          # ---------- setup.html ----------
           cat > proxy/templates/setup.html << 'HTMLEOF'
           {% extends "base.html" %}
           {% block body %}
@@ -612,7 +618,7 @@ jobs:
           {% endblock %}
           HTMLEOF
 
-          # ---------- login.html (unchanged) ----------
+          # ---------- login.html ----------
           cat > proxy/templates/login.html << 'HTMLEOF'
           {% extends "base.html" %}
           {% block body %}
@@ -630,7 +636,7 @@ jobs:
           {% endblock %}
           HTMLEOF
 
-          # ---------- dashboard.html (updated with runtime selection) ----------
+          # ---------- dashboard.html ----------
           cat > proxy/templates/dashboard.html << 'HTMLEOF'
           {% extends "base.html" %}
           {% block body %}
@@ -775,7 +781,7 @@ jobs:
           {% endblock %}
           HTMLEOF
 
-          # ---------- playground.html (unchanged) ----------
+          # ---------- playground.html ----------
           cat > proxy/templates/playground.html << 'HTMLEOF'
           {% extends "base.html" %}
           {% block body %}
@@ -967,7 +973,7 @@ jobs:
           {% endblock %}
           HTMLEOF
 
-          # ---------- keys.html (unchanged) ----------
+          # ---------- keys.html ----------
           cat > proxy/templates/keys.html << 'HTMLEOF'
           {% extends "base.html" %}
           {% block body %}
@@ -1097,7 +1103,7 @@ jobs:
           {% endblock %}
           HTMLEOF
 
-          # ---------- store.html (updated to show big models for AirLLM) ----------
+          # ---------- store.html ----------
           cat > proxy/templates/store.html << 'HTMLEOF'
           {% extends "base.html" %}
           {% block body %}
