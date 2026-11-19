@@ -5,9 +5,8 @@ on:
 
 jobs:
   deploy-ai-suite:
-    # ubuntu-latest now typically provides 4 vCPU / 16 GB RAM / 14 GB SSD.
-    # If your organisation still receives the older 2‑vCPU / 8 GB image,
-    # switch to a larger runner label such as ubuntu-latest-4-cores.
+    # ubuntu-latest typically provides 4 vCPU / 16 GB RAM / 14 GB SSD.
+    # If you still get 2 vCPU / 8 GB, switch to a larger runner label.
     runs-on: ubuntu-latest
 
     steps:
@@ -21,13 +20,11 @@ jobs:
 
       - name: Add Swap Space and Optimize Swappiness
         run: |
-          # 8 GB swap gives head‑room for model loading.
           sudo fallocate -l 8G /mnt/large-swapfile
           sudo chmod 600 /mnt/large-swapfile
           sudo mkswap /mnt/large-swapfile
           sudo swapon /mnt/large-swapfile
-          # A moderate swappiness allows the kernel to evict idle pages
-          # while the model is being memory‑mapped; 10 was too aggressive.
+          # Moderate swappiness lets the kernel evict idle pages while loading.
           sudo sysctl vm.swappiness=60
           free -h
 
@@ -39,17 +36,12 @@ jobs:
           pip install huggingface-hub fastapi uvicorn jinja2 python-multipart itsdangerous psutil
 
           # ----- AirLLM with CPU support -----
-          # The original lyogavin/airllm crashes on CPU because it calls
-          # torch.cuda.Stream() unconditionally.  The markstrefford fork
-          # contains the necessary guards and is compatible with modern
-          # transformers releases.
-          pip install git+https://github.com/markstrefford/airllm.git
-          # Fallback if that fork lags behind:
-          # pip install git+https://github.com/NavodPeiris/airllm-cpu-inference-support.git
+          # Official PyPI package (v2.10.1+) already includes CPU inference.
+          pip install airllm
+          # Guard against a too-new transformers that may break AirLLM.
+          pip install "transformers<5.0"
 
-          # Do NOT install bitsandbytes on a CPU runner – it will either
-          # fail to compile or be useless.
-          # pip install bitsandbytes   # <-- removed
+          # Do NOT install bitsandbytes on a CPU runner.
 
       - name: Install cloudflared
         run: |
@@ -64,12 +56,8 @@ jobs:
           import os
 
           # ---------- Hugging Face download stability ----------
-          # Xet (the new storage backend) frequently stalls on CI runners.
-          # Disabling it forces the classic CDN path, which is reliable.
-          os.environ["HF_HUB_DISABLE_XET"] = "1"
-          # HF_HUB_ENABLE_HF_TRANSFER is deprecated and can be a no‑op;
-          # we explicitly keep it off to avoid ambiguity.
-          os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+          os.environ["HF_HUB_DISABLE_XET"] = "1"          # disable Xet backend
+          os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"    # use standard HTTPS
 
           cpu_count = os.cpu_count() or 4
           physical_cores = max(1, cpu_count // 2) if cpu_count > 2 else cpu_count
@@ -99,7 +87,7 @@ jobs:
           from huggingface_hub import HfApi
           from llama_cpp import Llama
 
-          # ---------- AirLLM import (CPU‑compatible fork) ----------
+          # ---------- AirLLM import (official package, CPU-capable) ----------
           try:
               from airllm import AutoModel as AirLLMAutoModel
               AIRLLM_AVAILABLE = True
@@ -175,13 +163,13 @@ jobs:
               def __init__(self, model_path: str, n_ctx: int = 2048):
                   self.llm = Llama(
                       model_path=model_path,
-                      n_ctx=n_ctx,                # reduced from 4096 → less KV‑cache RAM
+                      n_ctx=n_ctx,                # reduced KV-cache size
                       n_threads=physical_cores,
                       n_threads_batch=physical_cores,  # do NOT use cpu_count
-                      n_batch=256,                # reduced from 512 → less peak RAM
+                      n_batch=256,                # reduced peak RAM
                       n_gpu_layers=0,
                       use_mlock=False,            # allow swapping
-                      use_mmap=True,              # let OS page weights on demand
+                      use_mmap=True,              # OS pages weights on demand
                       verbose=False,
                   )
                   self.model_name = Path(model_path).name
@@ -209,7 +197,7 @@ jobs:
               def __init__(self, repo_id: str, compression: str = None):
                   if not AIRLLM_AVAILABLE:
                       raise RuntimeError("AirLLM is not installed.")
-                  # On CPU, compression (4bit/8bit) is unsupported.
+                  # Compression (4bit/8bit) requires CUDA; force None on CPU.
                   try:
                       import torch
                       if not torch.cuda.is_available():
@@ -220,7 +208,6 @@ jobs:
                       repo_id,
                       compression=compression,
                       device="cpu",          # explicit CPU placement
-                      dtype=torch.float32 if 'torch' in globals() else None,
                   )
                   self.repo_id = repo_id
                   self.tokenizer = self.model.tokenizer
@@ -618,8 +605,6 @@ jobs:
           def robust_download(repo_id: str, filename: str, local_dir: str):
               url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
               dest = os.path.join(local_dir, filename)
-              # -L follows redirects, -C - resumes partial downloads,
-              # --retry 5 retries transient failures.
               subprocess.check_call([
                   "curl", "-L", "-C", "-", "--retry", "5",
                   "--retry-delay", "3", "-o", dest, url
@@ -679,12 +664,9 @@ jobs:
               }
           PYEOF
 
-          # ---------- Templates (identical to the original, omitted here for brevity) ----------
-          # The HTML templates (base.html, setup.html, login.html, dashboard.html,
-          # playground.html, keys.html, store.html) are copied verbatim from the
-          # original workflow.  They contain no logic that affects the fixes above.
-          # In a real deployment you would paste their full content here exactly as
-          # in the original file.
+          # ---------- Templates (omitted for brevity; paste original HTML here) ----------
+          # The full HTML templates are unchanged from the original workflow.
+          # Keep them exactly as they were in your previous file.
 
       - name: Start Custom Proxy
         run: |
